@@ -63,9 +63,41 @@ impl PacingAnalyzer {
             return PacingAction::KeepCap;
         }
 
-        // 1. Analyze pacing flatness against nominal frame time
+        // 1. Instant Cutscene Drop Detection: inspect recent cadence tail
+        let recent_count = intervals.len().min(15);
+        let recent_slice = &intervals[intervals.len() - recent_count..];
+        let recent_avg_ms = recent_slice.iter().sum::<f64>() / (recent_slice.len() as f64).max(1.0);
+        let recent_fps = if recent_avg_ms > 0.0 {
+            1000.0 / recent_avg_ms
+        } else {
+            current_cap as f64
+        };
+        let recent_late_frames = recent_slice.iter().filter(|&&dt| dt >= 28.0).count();
+
+        // If recent cadence drops >= drop_detection_fps and is near 30 FPS cutscene rate
+        if recent_fps <= 35.0
+            && recent_late_frames >= (recent_count / 2)
+            && current_cap >= (30 + self.config.step_fps)
+            && (current_cap as f64 - recent_fps) >= (self.config.drop_detection_fps as f64)
+        {
+            return PacingAction::JumpTo {
+                from_fps: current_cap,
+                to_fps: 30,
+            };
+        }
+
+        // 2. Compute dynamic late threshold scaled to the step delta
         let nominal_ms = 1000.0 / (current_cap as f64);
-        let late_threshold_ms = nominal_ms + self.config.spike_tolerance_ms;
+        let step_down_fps = current_cap
+            .saturating_sub(self.config.step_fps)
+            .max(self.config.min_fps);
+        let step_delta_ms = (1000.0 / (step_down_fps as f64)) - nominal_ms;
+        let dynamic_tolerance = if step_delta_ms > 0.0 {
+            (step_delta_ms * 0.45).clamp(0.2, self.config.spike_tolerance_ms)
+        } else {
+            self.config.spike_tolerance_ms.clamp(0.2, 1.0)
+        };
+        let late_threshold_ms = nominal_ms + dynamic_tolerance;
 
         let mut late_count = 0;
         let mut consecutive_late = 0;
@@ -85,33 +117,42 @@ impl PacingAnalyzer {
 
         let total_frames = intervals.len() as f64;
         let late_ratio = (late_count as f64) / total_frames;
-
         let is_isolated_spike = max_consecutive_late <= 2 && late_ratio < 0.08;
 
-        // 2. If sustained late frames occur, evaluate downward pressure
-        if !is_isolated_spike
-            && (late_ratio > self.config.late_frame_threshold_ratio || max_consecutive_late >= 3)
-        {
-            // Compute robust sustained FPS (trimming top/bottom 5% outliers)
-            let mut sorted = intervals.to_vec();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let trim = (sorted.len() as f64 * 0.05).floor() as usize;
-            let trimmed = if trim * 2 < sorted.len() {
-                &sorted[trim..sorted.len() - trim]
-            } else {
-                &sorted[..]
-            };
-            let avg_ms = if trimmed.is_empty() {
+        // Compute robust sustained FPS (trimming top/bottom 5% outliers)
+        let mut sorted = intervals.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let trim = (sorted.len() as f64 * 0.05).floor() as usize;
+        let trimmed = if trim * 2 < sorted.len() {
+            &sorted[trim..sorted.len() - trim]
+        } else {
+            &sorted[..]
+        };
+        let avg_ms = if trimmed.is_empty() {
+            nominal_ms
+        } else {
+            let sum: f64 = trimmed.iter().sum();
+            if sum <= 0.0 {
                 nominal_ms
             } else {
-                trimmed.iter().sum::<f64>() / (trimmed.len() as f64)
-            };
-            let sustained_fps = 1000.0 / avg_ms;
+                sum / (trimmed.len() as f64)
+            }
+        };
+        let sustained_fps = if avg_ms > 0.0 {
+            1000.0 / avg_ms
+        } else {
+            current_cap as f64
+        };
 
+        // 3. If sustained late frames occur or sustained FPS is below cap, evaluate downward pressure
+        if !is_isolated_spike
+            && (late_ratio > self.config.late_frame_threshold_ratio
+                || max_consecutive_late >= 3
+                || sustained_fps < (current_cap as f64 - 1.5))
+        {
             // Cutscene / massive drop check (e.g. 60 -> 30, drop >= drop_detection_fps)
             if (current_cap as f64 - sustained_fps) >= (self.config.drop_detection_fps as f64) {
                 let mut target = self.config.clamp_and_round_fps(sustained_fps);
-                // If sustained FPS is near 30 FPS cutscene, snap cleanly to 30
                 if sustained_fps <= 35.0 {
                     target = 30;
                 }
@@ -137,14 +178,21 @@ impl PacingAnalyzer {
             }
         }
 
-        // 3. Frametimes are flat and pacing is smooth: check for upward probe
+        // 4. Frametimes are flat, smooth, and game is achieving current cap: check for upward probe
         let probe_interval = if in_drop_state {
             Duration::from_secs_f64(self.config.drop_recheck_interval_secs)
         } else {
             Duration::from_secs_f64(self.config.stable_recheck_interval_secs)
         };
 
-        if now.duration_since(stable_since) >= probe_interval && current_cap < self.config.max_fps {
+        let is_pacing_smooth = late_count == 0 || (is_isolated_spike && late_ratio < 0.03);
+        let is_achieving_cap = sustained_fps >= (current_cap as f64 - 0.75);
+
+        if is_pacing_smooth
+            && is_achieving_cap
+            && now.duration_since(stable_since) >= probe_interval
+            && current_cap < self.config.max_fps
+        {
             let next_cap = (current_cap + self.config.step_fps).min(self.config.max_fps);
             return PacingAction::ProbeUp {
                 from_fps: current_cap,
@@ -159,6 +207,71 @@ impl PacingAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_cap_125_when_game_stuck_at_120_steps_down() {
+        let analyzer = PacingAnalyzer::new(AppConfig::default());
+        let now = Instant::now();
+        // Target 125 FPS (8.0ms), but game hardware max is 120 FPS (8.33ms)
+        let intervals = vec![8.333; 100];
+        let action = analyzer.evaluate_intervals(125, &intervals, now, now, false);
+        assert_eq!(
+            action,
+            PacingAction::StepDown {
+                from_fps: 125,
+                to_fps: 120
+            }
+        );
+    }
+
+    #[test]
+    fn test_cap_120_when_game_drops_to_110_steps_down() {
+        let analyzer = PacingAnalyzer::new(AppConfig::default());
+        let now = Instant::now();
+        // Target 120 FPS (8.33ms), game drops to 110 FPS (9.09ms)
+        let intervals = vec![9.09; 100];
+        let action = analyzer.evaluate_intervals(120, &intervals, now, now, false);
+        assert_eq!(
+            action,
+            PacingAction::StepDown {
+                from_fps: 120,
+                to_fps: 115
+            }
+        );
+    }
+
+    #[test]
+    fn test_cutscene_snap_is_instant_on_recent_cadence_drop() {
+        let analyzer = PacingAnalyzer::new(AppConfig::default());
+        let now = Instant::now();
+        // 80 frames at 16.66ms (60 FPS) followed by 20 frames at 33.33ms (30 FPS cutscene started 0.6s ago)
+        let mut intervals = vec![16.666; 80];
+        intervals.extend(vec![33.333; 20]);
+        let action = analyzer.evaluate_intervals(60, &intervals, now, now, false);
+        assert_eq!(
+            action,
+            PacingAction::JumpTo {
+                from_fps: 60,
+                to_fps: 30
+            }
+        );
+    }
+
+    #[test]
+    fn test_cap_65_when_game_stuck_at_60_steps_down() {
+        let analyzer = PacingAnalyzer::new(AppConfig::default());
+        let now = Instant::now();
+        // Target 65 FPS (15.38ms), but game hardware max is 60 FPS (16.66ms)
+        let intervals = vec![16.666; 100];
+        let action = analyzer.evaluate_intervals(65, &intervals, now, now, false);
+        assert_eq!(
+            action,
+            PacingAction::StepDown {
+                from_fps: 65,
+                to_fps: 60
+            }
+        );
+    }
 
     #[test]
     fn test_perfect_pacing_keeps_cap_before_probe_interval() {

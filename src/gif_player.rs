@@ -79,14 +79,21 @@ impl GifPlayer {
         self.prepare_textures(ctx);
 
         let now = Instant::now();
-        let current_delay = self.frames[self.current_index].1;
         let elapsed = now.duration_since(self.last_frame_time);
+        let mut current_delay = self.frames[self.current_index].1;
+
         if elapsed >= current_delay {
-            self.current_index = (self.current_index + 1) % self.frames.len();
-            self.last_frame_time = now;
+            let mut remaining_elapsed = elapsed;
+            while remaining_elapsed >= current_delay {
+                remaining_elapsed -= current_delay;
+                self.current_index = (self.current_index + 1) % self.frames.len();
+                current_delay = self.frames[self.current_index].1;
+            }
+            self.last_frame_time = now.checked_sub(remaining_elapsed).unwrap_or(now);
         }
 
-        let remaining = current_delay.saturating_sub(elapsed);
+        let current_elapsed = now.duration_since(self.last_frame_time);
+        let remaining = current_delay.saturating_sub(current_elapsed);
         ctx.request_repaint_after(remaining);
 
         self.textures.get(self.current_index)

@@ -13,6 +13,7 @@ pub struct UiTelemetry {
     pub pacing_status: String,
     pub ipc_connected: bool,
     pub in_drop_state: bool,
+    pub etw_active: bool,
 }
 
 impl Default for UiTelemetry {
@@ -26,6 +27,7 @@ impl Default for UiTelemetry {
             pacing_status: "STANDBY".to_string(),
             ipc_connected: false,
             in_drop_state: false,
+            etw_active: true,
         }
     }
 }
@@ -162,18 +164,25 @@ impl eframe::App for CyberApp {
                                     .font(FontId::monospace(10.0))
                                     .color(COLOR_TEXT_MUTED),
                             );
-                            let (measured_str, measured_color) = match telem.measured_fps {
-                                Some(fps) => (format!("{:.1}", fps), COLOR_EMERALD),
-                                None => ("--.-".to_string(), COLOR_TEXT_MUTED),
-                            };
+                            let (measured_str, measured_color) =
+                                match (telem.measured_fps, telem.etw_active) {
+                                    (Some(fps), _) => (format!("{:.1}", fps), COLOR_EMERALD),
+                                    (None, true) => ("--.-".to_string(), COLOR_TEXT_MUTED),
+                                    (None, false) => ("OFFLINE".to_string(), COLOR_AMBER),
+                                };
                             ui.label(
                                 RichText::new(measured_str)
                                     .font(FontId::monospace(36.0))
                                     .strong()
                                     .color(measured_color),
                             );
+                            let etw_tag = if telem.etw_active {
+                                "ETW DXGI"
+                            } else {
+                                "RUN ELEVATED"
+                            };
                             ui.label(
-                                RichText::new("ETW DXGI")
+                                RichText::new(etw_tag)
                                     .font(FontId::monospace(10.0))
                                     .color(COLOR_TEXT_MUTED),
                             );

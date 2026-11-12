@@ -9,7 +9,35 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU, VK_SHIFT};
+
+fn get_process_name_by_pid(pid: u32) -> Option<String> {
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let res = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        );
+        let _ = CloseHandle(handle);
+        if res.is_ok() && len > 0 {
+            let full_path = String::from_utf16_lossy(&buf[..len as usize]);
+            std::path::Path::new(&full_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+        } else {
+            None
+        }
+    }
+}
 
 struct ActiveGame {
     process_name: String,
@@ -32,6 +60,9 @@ struct EngineController {
     telemetry: Arc<Mutex<UiTelemetry>>,
     cmd_rx: Receiver<UiCommand>,
     hotkey_was_down: bool,
+    probing_state: Option<(u32, u32, Instant)>,
+    probe_cooldown_until: Option<Instant>,
+    last_ipc_retry: Instant,
 }
 
 impl EngineController {
@@ -70,6 +101,9 @@ impl EngineController {
             telemetry,
             cmd_rx,
             hotkey_was_down: false,
+            probing_state: None,
+            probe_cooldown_until: None,
+            last_ipc_retry: Instant::now(),
         }
     }
 
@@ -119,11 +153,27 @@ impl EngineController {
             );
             let _ = self.ipc.set_target_fps(new_cap);
             game.current_cap = new_cap;
+            self.probing_state = None;
+            self.probe_cooldown_until = None;
             game.state = AutoState::Settling {
                 cap_fps: new_cap,
                 settle_until: Instant::now() + Duration::from_millis(1500),
                 in_drop_state: new_cap < game.initial_cap,
             };
+        } else if self.ipc.is_connected() {
+            let current = self.ipc.get_target_fps().unwrap_or(60);
+            let new_cap = if delta < 0 {
+                current.saturating_sub((-delta) as u32)
+            } else {
+                current.saturating_add(delta as u32)
+            }
+            .clamp(self.config.min_fps, self.config.max_fps);
+
+            println!(
+                "[NUDGE] Manual idle cap adjustment: {} -> {} FPS",
+                current, new_cap
+            );
+            let _ = self.ipc.set_target_fps(new_cap);
         }
     }
 
@@ -132,7 +182,8 @@ impl EngineController {
         unsafe {
             let alt_down = (GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
             let shift_down = (GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
-            let a_down = (GetAsyncKeyState(0x41) as u16 & 0x8000) != 0;
+            let a_key = GetAsyncKeyState(0x41) as u16;
+            let a_down = (a_key & 0x8001) != 0;
 
             let is_down = alt_down && shift_down && a_down;
             if is_down && !self.hotkey_was_down {
@@ -154,7 +205,73 @@ impl EngineController {
             }
         }
 
-        // 2. Process events from FramePacer log
+        // 2. Periodic IPC connection attempt if disconnected
+        if !self.ipc.is_connected()
+            && now.duration_since(self.last_ipc_retry) >= Duration::from_millis(1000)
+        {
+            self.last_ipc_retry = now;
+            let _ = self.ipc.connect();
+        }
+
+        // Direct IPC game discovery (independent of log file location)
+        if self.ipc.is_connected() {
+            if self.active_game.is_none() {
+                if let Ok(true) = self.ipc.is_dll_attached() {
+                    let pid = self.ipc.get_attached_pid().ok().flatten().unwrap_or(0);
+                    if pid > 0 {
+                        let proc_name = get_process_name_by_pid(pid)
+                            .unwrap_or_else(|| format!("GameProcess_{}", pid));
+                        let is_excluded = self
+                            .config
+                            .exclude_processes
+                            .iter()
+                            .any(|ex| ex.eq_ignore_ascii_case(&proc_name));
+
+                        if !is_excluded {
+                            let cap = self
+                                .ipc
+                                .get_target_fps()
+                                .ok()
+                                .filter(|&f| f > 0)
+                                .unwrap_or(60);
+
+                            let _ = self.ipc.set_limiter_enabled(true);
+                            println!(
+                                "[IPC ATTACH] Game detected via IPC: {} (PID {}), active cap: {} FPS (Never-Off)",
+                                proc_name, pid, cap
+                            );
+
+                            self.active_game = Some(ActiveGame {
+                                process_name: proc_name,
+                                pid,
+                                initial_cap: cap,
+                                current_cap: cap,
+                                limiter_enabled: true,
+                                state: AutoState::Settling {
+                                    cap_fps: cap,
+                                    settle_until: now + Duration::from_millis(1500),
+                                    in_drop_state: false,
+                                },
+                                in_drop_state: false,
+                            });
+                        }
+                    }
+                }
+            } else if let Some(game) = &self.active_game
+                && let Ok(false) = self.ipc.is_dll_attached()
+            {
+                println!("[IPC DETACH] Game detached via IPC: {}", game.process_name);
+                let dead_pid = game.pid;
+                self.active_game = None;
+                self.probing_state = None;
+                self.probe_cooldown_until = None;
+                if let Ok(mut rec) = get_global_recorder().lock() {
+                    rec.clear_pid(dead_pid);
+                }
+            }
+        }
+
+        // 3. Process events from FramePacer log
         for ev in self.tailer.poll_log_events() {
             match ev.event.as_str() {
                 "ipc.ready" => {
@@ -232,6 +349,8 @@ impl EngineController {
                         println!("[DETACH] Game detached: {}", game.process_name);
                         let dead_pid = game.pid;
                         self.active_game = None;
+                        self.probing_state = None;
+                        self.probe_cooldown_until = None;
                         if let Ok(mut rec) = get_global_recorder().lock() {
                             rec.clear_pid(dead_pid);
                         }
@@ -253,7 +372,7 @@ impl EngineController {
             }
         }
 
-        // 3. Drive Never-Off auto-pacing state machine
+        // 4. Drive Never-Off auto-pacing state machine
         if self.auto_enabled {
             let mut next_state: Option<AutoState> = None;
 
@@ -308,9 +427,37 @@ impl EngineController {
                             in_drop_state,
                         );
 
+                        // Suppress ProbeUp if currently in failed-probe ceiling cooldown
+                        let in_cooldown = self
+                            .probe_cooldown_until
+                            .map(|until| now < until)
+                            .unwrap_or(false);
+                        let action = match action {
+                            PacingAction::ProbeUp { .. } if in_cooldown => PacingAction::KeepCap,
+                            other => other,
+                        };
+
                         match action {
                             PacingAction::KeepCap => {}
                             PacingAction::StepDown { from_fps, to_fps } => {
+                                // Check if this stepdown immediately follows an upward probe
+                                if let Some((p_from, p_to, p_time)) = self.probing_state.take()
+                                    && p_to == from_fps
+                                    && to_fps <= p_from
+                                    && now.duration_since(p_time) <= Duration::from_secs(12)
+                                {
+                                    let cooldown_dur = if game.in_drop_state {
+                                        Duration::from_secs(15)
+                                    } else {
+                                        Duration::from_secs(30)
+                                    };
+                                    println!(
+                                        "[PROBE CEILING] Ceiling encountered at {} FPS -> backing off probes for {:?}",
+                                        p_to, cooldown_dur
+                                    );
+                                    self.probe_cooldown_until = Some(now + cooldown_dur);
+                                }
+
                                 println!(
                                     "[STEP] Framing struggling -> lowering cap {} -> {} FPS",
                                     from_fps, to_fps
@@ -326,6 +473,8 @@ impl EngineController {
                                 });
                             }
                             PacingAction::JumpTo { from_fps, to_fps } => {
+                                self.probing_state = None;
+                                self.probe_cooldown_until = None;
                                 println!(
                                     "[CUTSCENE] Cutscene drop -> snapping cap {} -> {} FPS",
                                     from_fps, to_fps
@@ -340,6 +489,7 @@ impl EngineController {
                                 });
                             }
                             PacingAction::ProbeUp { from_fps, to_fps } => {
+                                self.probing_state = Some((from_fps, to_fps, now));
                                 println!(
                                     "[PROBE] Frametime flat for >= 8s -> probing cap {} -> {} FPS",
                                     from_fps, to_fps
@@ -366,7 +516,7 @@ impl EngineController {
             }
         }
 
-        // 4. Synchronize UI telemetry
+        // 5. Synchronize UI telemetry
         let measured_fps = self.active_game.as_ref().and_then(|g| {
             let recorder = get_global_recorder();
             let rec = recorder.lock().ok()?;
@@ -388,7 +538,13 @@ impl EngineController {
                     ..
                 } => ("CUTSCENE SNAP (30 FPS)".to_string(), true),
                 AutoState::PacingActive { stable_since, .. } => {
-                    if now.duration_since(stable_since) >= Duration::from_secs(8) {
+                    let in_cooldown = self
+                        .probe_cooldown_until
+                        .map(|until| now < until)
+                        .unwrap_or(false);
+                    if in_cooldown {
+                        ("CEILING LOCKED (STABLE)".to_string(), false)
+                    } else if now.duration_since(stable_since) >= Duration::from_secs(8) {
                         ("PROBING (+5 FPS)".to_string(), false)
                     } else {
                         ("PACING LOCKED".to_string(), false)
@@ -407,11 +563,12 @@ impl EngineController {
                 .active_game
                 .as_ref()
                 .map(|g| g.current_cap)
-                .unwrap_or(60);
+                .unwrap_or_else(|| self.ipc.get_target_fps().unwrap_or(60));
             telem.measured_fps = measured_fps;
             telem.pacing_status = status_str;
             telem.ipc_connected = self.ipc.is_connected();
             telem.in_drop_state = in_drop;
+            telem.etw_active = self.etw.is_some();
         }
     }
 
