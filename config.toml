@@ -1,0 +1,36 @@
+# FramePacer The Freak Configuration
+# Companion configuration for automatic FPS limit adjustment (Never-Off Architecture)
+
+# Minimum and Maximum FPS bounds
+min_fps = 30
+max_fps = 200
+
+# FPS adjustment step (FramePacer adjusts in 5 FPS steps)
+step_fps = 5
+
+# Flatline duration (in seconds) of stable frametimes before probing +5 FPS
+stable_recheck_interval_secs = 8.0
+
+# Faster probe interval (in seconds) in cutscenes to detect when gameplay resumes
+drop_recheck_interval_secs = 4.0
+
+# Tolerance (in ms) above target frame time before a frame is flagged as late
+spike_tolerance_ms = 2.0
+
+# Ratio of late frames in a window needed to trigger a step down
+late_frame_threshold_ratio = 0.05
+
+# Cutscene drop delta (e.g. 60 -> 30 FPS) triggering immediate snap to 30 FPS
+drop_detection_fps = 15
+
+# Delay (in milliseconds) between synthetic keystrokes for safe processing
+hotkey_settle_ms = 80
+
+# Path to FramePacer's event log
+framepacer_log_path = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\framepacer\\framepacer.log"
+
+# Games/executables to exclude from automatic limiting (e.g. ["launcher.exe"])
+exclude_processes = []
+
+# Whether auto limiting starts enabled on launch
+auto_enabled_at_startup = true
