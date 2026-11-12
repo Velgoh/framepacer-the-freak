@@ -119,10 +119,10 @@ impl AppConfig {
 
     /// Snaps an FPS value to the nearest step within [min_fps, max_fps].
     /// Rounds down to ensure sustainable frame pacing headroom (per spec: "cap = native rounded down to 5"),
-    /// with a small 0.5 FPS tolerance to accommodate VSync / timer jitter (e.g. 59.8 -> 60, but 58.3 -> 55).
+    /// with a small 0.2 FPS tolerance to accommodate VSync / timer jitter (e.g. 59.8 -> 60, but 64.6 -> 60).
     pub fn clamp_and_round_fps(&self, fps: f64) -> u32 {
         let step = self.step_fps.max(1) as f64;
-        let rounded = ((fps + 0.5) / step).floor() * step;
+        let rounded = ((fps + 0.2) / step).floor() * step;
         let rounded_u32 = rounded as u32;
         rounded_u32.clamp(self.min_fps, self.max_fps)
     }
@@ -145,10 +145,12 @@ mod tests {
     #[test]
     fn test_clamp_and_round() {
         let cfg = AppConfig::default();
-        // 59.8 is near 60 (within 0.5 FPS tolerance) -> 60
+        // 59.8 is near 60 (within 0.2 FPS tolerance) -> 60
         assert_eq!(cfg.clamp_and_round_fps(59.8), 60);
         // 58.3 cannot hold 60 FPS -> rounded down to 55 per pacing headroom spec
         assert_eq!(cfg.clamp_and_round_fps(58.3), 55);
+        // 64.6 cannot hold 65 FPS -> rounded down to 60
+        assert_eq!(cfg.clamp_and_round_fps(64.6), 60);
         // 52.1 cannot hold 55 FPS -> rounded down to 50
         assert_eq!(cfg.clamp_and_round_fps(52.1), 50);
         // Under min_fps (30) -> clamps to 30

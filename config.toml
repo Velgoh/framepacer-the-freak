@@ -1,5 +1,5 @@
 # FramePacer The Freak Configuration
-# Companion configuration for automatic FPS limit adjustment (Never-Off Architecture)
+# Companion configuration for automatic FPS limit adjustment (Pulse-Benchmarking Architecture)
 
 # Minimum and Maximum FPS bounds
 min_fps = 30

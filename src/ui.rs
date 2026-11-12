@@ -16,14 +16,11 @@ pub fn get_window_json_path() -> PathBuf {
         && let Some(parent) = exe.parent()
     {
         let data_dir = parent.join("data");
-        if data_dir.is_dir() {
-            return data_dir.join("window.json");
-        }
+        let _ = std::fs::create_dir_all(&data_dir);
+        return data_dir.join("window.json");
     }
     let local_data = PathBuf::from("data");
-    if !local_data.exists() {
-        let _ = std::fs::create_dir_all(&local_data);
-    }
+    let _ = std::fs::create_dir_all(&local_data);
     local_data.join("window.json")
 }
 
@@ -492,9 +489,10 @@ impl eframe::App for FreakApp {
                 }
 
                 // H. Bottom-Right: Thin, Faint Moonbeam FPS Numeral (Zero words, NO backing box)
-                let numeral_str = match telem.measured_fps {
-                    Some(fps) if fps > 0.0 => format!("{:.0}", fps),
-                    _ => "—".to_string(),
+                let numeral_str = if telem.current_cap > 0 {
+                    format!("{}", telem.current_cap)
+                } else {
+                    "—".to_string()
                 };
 
                 // Brief glyph flicker or number fade while the limiter-off benchmark runs
@@ -572,5 +570,30 @@ mod tests {
         let decoded: WindowPosition = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded.x, 240.5);
         assert_eq!(decoded.y, 180.0);
+    }
+
+    #[test]
+    fn test_fps_numeral_formatting() {
+        let telem_49 = UiTelemetry {
+            current_cap: 49,
+            ..Default::default()
+        };
+        let s_49 = if telem_49.current_cap > 0 {
+            format!("{}", telem_49.current_cap)
+        } else {
+            "—".to_string()
+        };
+        assert_eq!(s_49, "49");
+
+        let telem_zero = UiTelemetry {
+            current_cap: 0,
+            ..Default::default()
+        };
+        let s_zero = if telem_zero.current_cap > 0 {
+            format!("{}", telem_zero.current_cap)
+        } else {
+            "—".to_string()
+        };
+        assert_eq!(s_zero, "—");
     }
 }

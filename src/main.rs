@@ -176,6 +176,7 @@ impl EngineController {
                     );
                     game.current_cap = live_fps;
                     game.initial_cap = live_fps;
+                    game.in_drop_state = false;
                     game.state = AutoState::Settling {
                         cap_fps: live_fps,
                         settle_until: now + Duration::from_millis(1500),
@@ -206,7 +207,7 @@ impl EngineController {
 
                             let _ = self.ipc.set_limiter_enabled(true);
                             println!(
-                                "[IPC ATTACH] Game detected via IPC: {} (PID {}), active cap: {} FPS (Never-Off)",
+                                "[IPC ATTACH] Game detected via IPC: {} (PID {}), active cap: {} FPS",
                                 proc_name, pid, cap
                             );
 
@@ -271,11 +272,10 @@ impl EngineController {
                             cap = live_fps;
                         }
 
-                        // In Never-Off pacing: Keep limiter enabled 100% of the time!
                         let _ = self.ipc.set_limiter_enabled(true);
 
                         println!(
-                            "[ATTACH] Game attached: {} (PID {}), active cap: {} FPS (Never-Off)",
+                            "[ATTACH] Game attached: {} (PID {}), active cap: {} FPS",
                             target, pid, cap
                         );
 
@@ -302,6 +302,8 @@ impl EngineController {
                             && target_fps > 0
                         {
                             game.current_cap = target_fps;
+                            game.initial_cap = target_fps;
+                            game.in_drop_state = false;
                         }
                         if let Some(en) = ev.get_bool("enabled") {
                             game.limiter_enabled = en;
@@ -337,7 +339,7 @@ impl EngineController {
             }
         }
 
-        // 4. Drive Never-Off auto-pacing state machine
+        // 4. Drive auto-pacing state machine
         if self.auto_enabled {
             let mut next_state: Option<AutoState> = None;
 
@@ -468,12 +470,11 @@ impl EngineController {
                             let _ = self.ipc.set_limiter_enabled(true);
                             game.current_cap = new_cap;
                             game.limiter_enabled = true;
-                            let still_in_drop = new_cap < game.initial_cap;
-                            game.in_drop_state = still_in_drop;
+                            game.in_drop_state = false;
                             next_state = Some(AutoState::Settling {
                                 cap_fps: new_cap,
                                 settle_until: now + Duration::from_millis(1000),
-                                in_drop_state: still_in_drop,
+                                in_drop_state: false,
                             });
                         }
                     }
@@ -558,7 +559,7 @@ impl EngineController {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== FRAMEPACER // THE FREAK (Never-Off Auto-Pacing) ===");
+    println!("=== FRAMEPACER // THE FREAK ===");
 
     let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
     let config_dir = exe_path
@@ -585,7 +586,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn background pacing engine thread (running at 100ms cadence)
     let engine_thread = std::thread::spawn(move || {
         let mut engine = EngineController::new(config_path, engine_telemetry, cmd_rx);
-        println!("[READY] Pacing engine initialized. Never-Off active.");
+        println!("[READY] Pacing engine initialized.");
 
         while engine_running.load(Ordering::Relaxed) {
             engine.tick();

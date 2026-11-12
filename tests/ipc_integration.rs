@@ -178,3 +178,22 @@ fn test_ipc_preserves_dll_attached_on_limiter_toggle() {
     assert!(client.get_limiter_enabled().unwrap());
     assert!(client.is_dll_attached().unwrap());
 }
+
+#[test]
+fn test_manual_cap_change_49_detection() {
+    let mock_section_name = format!(r"Local\FPTestManualCap49_{}", std::process::id());
+
+    let mut server = FramepacerIpc::create_mock_for_test(&mock_section_name)
+        .expect("Server failed to create mock IPC");
+
+    let client = FramepacerIpc::with_name(&mock_section_name);
+    let mut companion = client;
+    companion.connect().expect("Failed to connect companion");
+
+    // Simulating user in FramePacer GUI typing 49 and clicking Apply
+    server.set_target_fps(49).unwrap();
+
+    // Companion must observe 49 immediately
+    let live_fps = companion.get_target_fps().expect("get_target_fps failed");
+    assert_eq!(live_fps, 49, "Companion must detect manual cap of 49 FPS");
+}
