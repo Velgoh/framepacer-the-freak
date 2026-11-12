@@ -1,10 +1,6 @@
-# FramePacer: The Freak
+# THE FREAK
 
-An autonomous frame-pacing companion for FramePacer. Regulates target framerate caps in real-time through direct Win32 shared memory inter-process communication (IPC) and kernel-level Event Tracing for Windows (ETW), without modifying FramePacer or injecting DLLs into target game processes.
-
----
-
-## Architecture Overview
+## Technical Architecture
 
 ```
 +------------------------------------------------------------------+
@@ -12,8 +8,8 @@ An autonomous frame-pacing companion for FramePacer. Regulates target framerate 
 |                                                                  |
 |   +-------------------+   IPC Writes   +---------------------+   |
 |   | Engine Controller | -------------> | Local\              |   |
-|   |  (Never-Off State |                | FramepacerIPC_v5    |   |
-|   |   Machine, 100ms) |                | (Win32 MMF)         |   |
+|   |  (Pulse Benchmark |                | FramepacerIPC_v5    |   |
+|   |   State Machine)  |                | (Win32 MMF)         |   |
 |   +-------------------+                +---------------------+   |
 |             ^                                     |              |
 |             | Frame intervals                     v              |
@@ -34,44 +30,53 @@ An autonomous frame-pacing companion for FramePacer. Regulates target framerate 
 
 ## Inter-Process Communication (`Local\FramepacerIPC_v5`)
 
-The companion synchronizes directly with FramePacer via a Win32 file mapping object named `Local\FramepacerIPC_v5`.
+The system maps the Win32 file mapping object named `Local\FramepacerIPC_v5` with `FILE_MAP_READ | FILE_MAP_WRITE` permissions.
 
-### Shared Memory Layout
+### Shared Memory Section Layout
 
 | Offset (Hex) | Offset (Dec) | Type  | Description |
 |---|---|---|---|
 | `0x000` | 0 | `u32` | Header Magic: `0x43504946` (`"FIPC"`) |
-| `0x004` | 4 | `u32` | IPC Protocol Version (`5`) |
-| `0x008` | 8 | `u32` | Section Size (`1256` bytes) |
-| `0x020` | 32 | `u32` | IPC Active Flag (`1` = active) |
-| `0x028` | 40 | `u32` | Target FPS in millihertz (`fps * 1000`, e.g., `60000` for 60.0 FPS) |
-| `0x02C` | 44 | `u32` | Limiter Enabled Flag (`1` = enabled, `0` = disabled) |
+| `0x004` | 4 | `u32` | Protocol Version (`5`) |
+| `0x008` | 8 | `u32` | Section Allocation Size (`1256` bytes) |
+| `0x020` | 32 | `u32` | IPC Active Status (`1` = active) |
+| `0x028` | 40 | `u32` | Target Framerate in millihertz (`fps * 1000`, e.g. `60000` for 60.0 FPS) |
+| `0x02C` | 44 | `u32` | Limiter State (`1` = enabled, `0` = disabled) |
 | `0x030` | 48 | `u32` | Display Refresh Rate in millihertz |
-| `0x034` | 52 | `u32` | Limiter Mode |
-| `0x408` | 1032 | `u32` | In-game DLL Attached Status / Mirrored Limiter Flag |
-| `0x40C` | 1036 | `u32` | Target Process ID |
-| `0x414` | 1044 | `u32` | Mirrored Target FPS (Direct integer cap) |
-| `0x420` | 1056 | `u32` | DLL Target Process ID |
+| `0x034` | 52 | `u32` | Limiter Execution Mode (`2` = normal) |
+| `0x408` | 1032 | `u32` | In-Game Hook Attachment Flag (`1` = attached) / Mirrored Limiter Flag |
+| `0x40C` | 1036 | `u32` | Target Game Process ID |
+| `0x414` | 1044 | `u32` | Mirrored Target Framerate Cap (direct integer) |
+| `0x420` | 1056 | `u32` | In-Game Hook Active Process ID |
 
-IPC writes execute via volatile atomic stores with sequential consistency fences (`fence(Ordering::SeqCst)`), completing in under 15 microseconds per adjustment without queuing synthetic keyboard inputs.
+### Atomic Read/Write Semantics
+- Memory writes execute via volatile atomic stores with sequential consistency memory fences (`fence(Ordering::SeqCst)`).
+- Limiter disengagement and re-engagement write directly to offset `0x02C`.
+- Target FPS modifications update native millihertz at `0x028` and direct cap integer at `0x414`.
+
+### Live Shared Memory Polling
+Every 100ms cycle, offset `0x028` / `0x414` is read. If the value differs from the internal active cap state (e.g. an external modification via FramePacer's GUI), the engine immediately synchronizes its internal state, adopts the new cap, and resets the settling timer.
 
 ---
 
-## ETW Present Hooking
+## Real-Time ETW Metric Acquisition
 
-Framerate and frame interval metrics are acquired without process injection by consuming real-time kernel Event Tracing for Windows (ETW) events:
+Frametimes and delivery intervals are measured through kernel Event Tracing for Windows (ETW) without code injection:
 
-- **Provider GUID**: `Microsoft-Windows-DXGI` (`{CA11C036-0102-4A2D-A6AD-F03CFED5D3C9}`)
-- **Event ID**: `42` (`DXGIPresent_Start`)
+- **Primary Provider**: `Microsoft-Windows-DXGI` (`{CA11C036-0102-4A2D-A6AD-F03CFED5D3C9}`)
+- **Event Identifier**: `42` (`DXGIPresent_Start`)
 - **Secondary Provider**: `Microsoft-Windows-D3D9` (`{783ACA0A-790E-4D7F-8451-AA850511C6B9}`)
+- **Event Identifier**: `1`
 
-Timestamps are captured as QueryPerformanceCounter (QPC) values from `EVENT_HEADER.TimeStamp` and stored in a fixed ring buffer per process ID. Instantaneous frametime intervals ($\Delta t$) and rolling FPS are computed over a 2.5-second sliding window.
+Timestamps are extracted from `EVENT_HEADER.TimeStamp` as 64-bit QueryPerformanceCounter (QPC) ticks. Frametime intervals ($\Delta t$) are computed relative to the system performance counter frequency ($QPC_{freq}$):
+
+$$\Delta t_{ms} = \frac{\Delta QPC \times 1000}{QPC_{freq}}$$
+
+A per-PID ring buffer maintains a 2.5-second sliding window of frame timestamps.
 
 ---
 
-## Never-Off Auto-Pacing State Machine
-
-The pacing limiter remains engaged at all times. Native frequency sampling with the limiter disabled has been eliminated to prevent frame delivery disruption.
+## Pulse-Benchmarking State Machine
 
 ```
                          +--------------+
@@ -83,35 +88,65 @@ The pacing limiter remains engaged at all times. Native frequency sampling with 
                |             Settling             | <---+
                | (Cooldown window: 1000 - 1500ms) |     |
                +----------------------------------+     |
-                                | Settle timer expired  | Cap changed
+                                | Settle timer expired  |
                                 v                       |
-               +----------------------------------+     |
+               +----------------------------------+     | Cap changed
 +------------> |           PacingActive           | ----+
-|              |     (Continuous In-Band Eval)    |
+|              |  (Limiter ON: Continuous Eval)   |
 |              +----------------------------------+
 |                |              |              |
-| KeepCap        | ProbeUp (+5) | StepDown (-5)| JumpTo (30)
-| (Smooth)       | (Flat >= 8s) | (Late ratio) | (Delta >= 15 FPS)
+| KeepCap        | 30s Recheck  | StepDown (-5)| JumpTo (30)
+| (Smooth)       | Elapsed      | (Late ratio) | (Delta >= 15 FPS)
 +----------------+              v              v
-                        [Trigger Settle]  [Trigger Settle]
+                        +---------------+
+                        |MeasuringNative|
+                        | (1.0s Limiter |
+                        |     OFF)      |
+                        +---------------+
+                                | 1.0s expired -> read ETW native FPS
+                                | snap cap down to 5-FPS boundary
+                                | turn limiter back ON
+                                v
+                        [Trigger Settle]
 ```
 
-### Decision Rules
+### Execution Rules
 
-1. **Step Down**: If late frame ratio exceeds threshold (`> 5%`) or $\ge 3$ consecutive late frames occur, the cap decrements by `step_fps` (default: 5 FPS), bounded by `min_fps` (30 FPS).
-2. **Cutscene Snap**: If sustained rendering drops by $\ge 15$ FPS relative to the cap, the engine snaps immediately to 30 FPS (`in_drop_state = true`).
-3. **In-Band Probe**: When frametimes remain flat with no consecutive late frames for $\ge 8.0$ seconds (or $\ge 4.0$ seconds when recovering from a cutscene), the engine increments the cap by $+5$ FPS up to `max_fps`. If the probe causes frame drops, the step-down rule immediately restores the previous cap.
+1. **30-Second Periodic Benchmark Pulse**:
+   - Every 30.0 seconds of stable pacing (`stable_recheck_interval_secs`), the engine transitions to `AutoState::MeasuringNative`.
+   - Limiter is disengaged (`0x02C = 0`).
+   - Frame intervals are recorded uncapped for exactly 1.0 second (`measure_duration_secs = 1.0`).
+   - Native uncapped FPS is calculated from the measured interval set:
+     $$FPS_{native} = \frac{N \times 1000}{\sum_{i=1}^{N} \Delta t_i}$$
+   - Target cap is snapped down to the nearest 5-FPS boundary:
+     $$Cap = \left\lfloor \frac{FPS_{native} + 0.5}{5} \right\rfloor \times 5$$
+   - The computed cap is written to `0x028` and `0x414`.
+   - Limiter is immediately re-engaged (`0x02C = 1`).
+   - Engine enters `AutoState::Settling` for 1000ms.
+
+2. **Immediate Downward Cadence Reaction**:
+   - If late frame ratio exceeds `0.05` or $\ge 3$ consecutive late frames occur during `PacingActive`, cap decrements by 5 FPS immediately.
+   - If rendering drops by $\ge 15$ FPS relative to cap (e.g. 30 FPS cutscene), engine snaps cap directly to 30 FPS.
+   - While in drop state, recheck interval is accelerated to 4.0 seconds (`drop_recheck_interval_secs`) to detect gameplay resumption.
+
+3. **Live Cap Synchronization**:
+   - Polling occurs every 100ms. External modifications to `0x028` update the active cap immediately without fighting or reverting user input.
 
 ---
 
-## User Interface
+## Window Geometry & Persistence
 
-Desktop dashboard constructed in 100% Rust utilizing `eframe` and `egui`:
-
-- Always-on-Top floating HUD (`with_always_on_top`).
-- Real-time telemetry: Target FPS cap, live DXGI ETW measured FPS, active game PID, and state machine cadence.
-- Embedded frame-accurate playback of `kaine-cry.gif` decoded via the `image` crate.
-- Global hotkey listener: `Alt + Shift + A` via `GetAsyncKeyState`.
+- **Dimensions**: Viewport is initialized to `300 x 228` pixels (aspect ratio 1.315:1 matching source visual assets).
+- **Decorations**: System borders and titlebars are disabled (`with_decorations(false)`).
+- **Z-Order**: Configured with `with_always_on_top(true)`.
+- **Position Storage**: Window coordinates are loaded from and saved to `data/window.json`:
+  ```json
+  {
+    "x": 300.0,
+    "y": 200.0
+  }
+  ```
+- **Pointer Gating**: Interactive glyphs (auto sigil, minimize, close) are rendered exclusively when the pointer hovers inside the window area (`hover_pos().is_some()`).
 
 ---
 
@@ -121,11 +156,13 @@ Desktop dashboard constructed in 100% Rust utilizing `eframe` and `egui`:
 min_fps = 30
 max_fps = 200
 step_fps = 5
-stable_recheck_interval_secs = 8.0
+stable_recheck_interval_secs = 30.0
+measure_duration_secs = 1.0
 drop_recheck_interval_secs = 4.0
 spike_tolerance_ms = 2.0
 late_frame_threshold_ratio = 0.05
 drop_detection_fps = 15
+hotkey_settle_ms = 80
 framepacer_log_path = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\framepacer\\framepacer.log"
 exclude_processes = []
 auto_enabled_at_startup = true
@@ -151,4 +188,6 @@ target/release/framepacer-the-freak.exe
 
 ---
 
-*Glory to mankind.*
+## Support
+
+Glory to mankind.

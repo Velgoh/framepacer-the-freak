@@ -9,15 +9,20 @@ pub enum PacingAction {
     StepDown { from_fps: u32, to_fps: u32 },
     /// Jumping directly to target_fps (e.g. 30 in cutscenes).
     JumpTo { from_fps: u32, to_fps: u32 },
-    /// Gently probing +5 FPS when frametimes have been flat for >= 8s.
-    ProbeUp { from_fps: u32, to_fps: u32 },
+    /// Disengage limiter briefly (for 1.0s) to measure native uncapped FPS.
+    MeasureNative,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoState {
     /// Waiting for game or disabled.
     Idle,
-    /// Actively pacing at current cap (limiter NEVER turns off).
+    /// Measuring native uncapped FPS for measure_duration_secs (limiter disengaged).
+    MeasuringNative {
+        started_at: Instant,
+        previous_cap: u32,
+    },
+    /// Actively pacing at current cap (limiter engaged).
     PacingActive {
         cap_fps: u32,
         stable_since: Instant,
@@ -178,8 +183,8 @@ impl PacingAnalyzer {
             }
         }
 
-        // 4. Frametimes are flat, smooth, and game is achieving current cap: check for upward probe
-        let probe_interval = if in_drop_state {
+        // 4. Frametimes are flat, smooth, and game is achieving current cap: check for periodic 30s benchmark pulse
+        let benchmark_interval = if in_drop_state {
             Duration::from_secs_f64(self.config.drop_recheck_interval_secs)
         } else {
             Duration::from_secs_f64(self.config.stable_recheck_interval_secs)
@@ -190,14 +195,9 @@ impl PacingAnalyzer {
 
         if is_pacing_smooth
             && is_achieving_cap
-            && now.duration_since(stable_since) >= probe_interval
-            && current_cap < self.config.max_fps
+            && now.duration_since(stable_since) >= benchmark_interval
         {
-            let next_cap = (current_cap + self.config.step_fps).min(self.config.max_fps);
-            return PacingAction::ProbeUp {
-                from_fps: current_cap,
-                to_fps: next_cap,
-            };
+            return PacingAction::MeasureNative;
         }
 
         PacingAction::KeepCap
@@ -332,36 +332,24 @@ mod tests {
     }
 
     #[test]
-    fn test_never_off_probes_plus_5_when_flat_for_8_seconds() {
+    fn test_benchmark_triggers_after_30_seconds_of_stable_frametimes() {
         let analyzer = PacingAnalyzer::new(AppConfig::default());
-        let past = Instant::now() - Duration::from_secs(9); // >= 8s flat line
+        let past = Instant::now() - Duration::from_secs(31); // >= 30s stable pacing
         let now = Instant::now();
         let intervals = vec![16.66; 100];
         let action = analyzer.evaluate_intervals(60, &intervals, now, past, false);
-        assert_eq!(
-            action,
-            PacingAction::ProbeUp {
-                from_fps: 60,
-                to_fps: 65
-            }
-        );
+        assert_eq!(action, PacingAction::MeasureNative);
     }
 
     #[test]
-    fn test_drop_state_probes_up_faster_to_resume_gameplay() {
+    fn test_drop_state_triggers_benchmark_faster_after_4_seconds() {
         let analyzer = PacingAnalyzer::new(AppConfig::default());
-        let past = Instant::now() - Duration::from_secs(5); // >= 4s drop probe
+        let past = Instant::now() - Duration::from_secs(5); // >= 4s drop recheck
         let now = Instant::now();
         // 30 FPS flat frames
         let intervals = vec![33.33; 100];
         let action = analyzer.evaluate_intervals(30, &intervals, now, past, true);
-        assert_eq!(
-            action,
-            PacingAction::ProbeUp {
-                from_fps: 30,
-                to_fps: 35
-            }
-        );
+        assert_eq!(action, PacingAction::MeasureNative);
     }
 
     #[test]
@@ -411,13 +399,13 @@ mod tests {
     }
 
     #[test]
-    fn test_probe_caps_at_max_fps() {
+    fn test_flat_frametimes_before_30s_keeps_cap() {
         let analyzer = PacingAnalyzer::new(AppConfig::default());
         let past = Instant::now() - Duration::from_secs(10);
         let now = Instant::now();
         let intervals = vec![5.0; 100]; // 200 FPS
         let action = analyzer.evaluate_intervals(200, &intervals, now, past, false);
-        // At max_fps (200), cannot probe higher -> KeepCap
+        // Under 30 seconds -> KeepCap
         assert_eq!(action, PacingAction::KeepCap);
     }
 }

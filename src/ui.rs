@@ -1,6 +1,55 @@
 use crate::gif_player::GifPlayer;
-use egui::{Align, Color32, FontId, Layout, RichText, Rounding, Stroke, Vec2};
+use egui::{Color32, FontId, Pos2, Rect, Rounding, Stroke, Vec2};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Window position data stored strictly in data/window.json.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct WindowPosition {
+    pub x: f32,
+    pub y: f32,
+}
+
+pub fn get_window_json_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        let data_dir = parent.join("data");
+        if data_dir.is_dir() {
+            return data_dir.join("window.json");
+        }
+    }
+    let local_data = PathBuf::from("data");
+    if !local_data.exists() {
+        let _ = std::fs::create_dir_all(&local_data);
+    }
+    local_data.join("window.json")
+}
+
+pub fn load_window_position() -> Option<[f32; 2]> {
+    let path = get_window_json_path();
+    if let Ok(content) = std::fs::read_to_string(&path)
+        && let Ok(pos) = serde_json::from_str::<WindowPosition>(&content)
+    {
+        return Some([pos.x, pos.y]);
+    }
+    None
+}
+
+pub fn save_window_position(pos: [f32; 2]) {
+    let path = get_window_json_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let data = WindowPosition {
+        x: pos[0],
+        y: pos[1],
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&data) {
+        let _ = std::fs::write(&path, json);
+    }
+}
 
 /// Thread-safe telemetry shared between the pacing engine and the GUI.
 #[derive(Debug, Clone)]
@@ -10,6 +59,7 @@ pub struct UiTelemetry {
     pub active_game_pid: Option<u32>,
     pub current_cap: u32,
     pub measured_fps: Option<f64>,
+    pub is_measuring_native: bool,
     pub pacing_status: String,
     pub ipc_connected: bool,
     pub in_drop_state: bool,
@@ -24,6 +74,7 @@ impl Default for UiTelemetry {
             active_game_pid: None,
             current_cap: 60,
             measured_fps: None,
+            is_measuring_native: false,
             pacing_status: "STANDBY".to_string(),
             ipc_connected: false,
             in_drop_state: false,
@@ -34,309 +85,450 @@ impl Default for UiTelemetry {
 
 pub enum UiCommand {
     ToggleAuto,
-    NudgeCap(i32),
 }
 
-pub struct CyberApp {
+pub struct FreakApp {
     telemetry: Arc<Mutex<UiTelemetry>>,
     command_sender: std::sync::mpsc::Sender<UiCommand>,
     gif_player: GifPlayer,
+    last_saved_pos: Option<[f32; 2]>,
+    last_seen_pos: Option<[f32; 2]>,
+    pos_last_moved: Option<Instant>,
 }
 
-impl CyberApp {
+impl FreakApp {
     pub fn new(
         telemetry: Arc<Mutex<UiTelemetry>>,
         command_sender: std::sync::mpsc::Sender<UiCommand>,
     ) -> Self {
+        let saved = load_window_position();
         Self {
             telemetry,
             command_sender,
-            gif_player: GifPlayer::new_embedded(),
+            gif_player: GifPlayer::load_default(),
+            last_saved_pos: saved,
+            last_seen_pos: saved,
+            pos_last_moved: None,
         }
     }
 }
 
-// Cyber aesthetic color palette
-const COLOR_BG: Color32 = Color32::from_rgb(10, 12, 16);
-const COLOR_CARD: Color32 = Color32::from_rgb(18, 22, 30);
-const COLOR_CYAN: Color32 = Color32::from_rgb(0, 240, 255);
-const COLOR_EMERALD: Color32 = Color32::from_rgb(0, 255, 170);
-const COLOR_AMBER: Color32 = Color32::from_rgb(255, 184, 0);
-const COLOR_CRIMSON: Color32 = Color32::from_rgb(255, 59, 92);
-const COLOR_TEXT_MUTED: Color32 = Color32::from_rgb(130, 145, 165);
+impl Drop for FreakApp {
+    fn drop(&mut self) {
+        if let Some(pos) = self.last_seen_pos {
+            save_window_position(pos);
+        }
+    }
+}
 
-impl eframe::App for CyberApp {
+// Aesthetic palette derived from kaine-cry.gif & NieR Replicant
+const COLOR_LUNAR_CYAN: Color32 = Color32::from_rgb(126, 174, 196); // #7eaec4
+const COLOR_LUNAR_GLOW_BRIGHT: Color32 = Color32::from_rgb(164, 200, 217); // #a4c8d9
+const COLOR_LUNAR_SILVER: Color32 = Color32::from_rgb(143, 162, 181); // #8fa2b5
+const COLOR_DIM_IRON: Color32 = Color32::from_rgb(38, 45, 54); // #262d36
+const COLOR_DIM_IRON_CORE: Color32 = Color32::from_rgb(26, 31, 38);
+const COLOR_BORDER: Color32 = Color32::from_rgb(54, 65, 78); // #36414e
+const COLOR_BG_DARK: Color32 = Color32::from_rgb(10, 11, 14); // #0a0b0e
+
+impl eframe::App for FreakApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let telem = self.telemetry.lock().unwrap().clone();
 
-        // Configure cyber visuals
+        // 1. Position tracking and debounced save to data/window.json
+        if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
+            let current_pos = [outer.min.x, outer.min.y];
+            if current_pos[0].is_finite() && current_pos[1].is_finite() {
+                if self.last_seen_pos != Some(current_pos) {
+                    self.last_seen_pos = Some(current_pos);
+                    self.pos_last_moved = Some(Instant::now());
+                } else if let Some(last_moved) = self.pos_last_moved
+                    && last_moved.elapsed() >= Duration::from_millis(500)
+                    && self.last_saved_pos != Some(current_pos)
+                {
+                    save_window_position(current_pos);
+                    self.last_saved_pos = Some(current_pos);
+                    self.pos_last_moved = None;
+                }
+            }
+        }
+
+        // 2. Slow fade-in on startup (over 1.0 second)
+        let fade_in = ctx.animate_value_with_time(egui::Id::new("freak_fade_in"), 1.0, 1.0);
+
+        // 3. Hover state detection: controls visible only when cursor is inside window
+        let has_pointer = ctx.input(|i| i.pointer.hover_pos().is_some());
+        let hover_alpha = ctx.animate_bool(egui::Id::new("freak_hover_alpha"), has_pointer);
+
         let mut style = (*ctx.style()).clone();
         style.visuals.dark_mode = true;
-        style.visuals.panel_fill = COLOR_BG;
-        style.visuals.window_fill = COLOR_BG;
-        style.visuals.override_text_color = Some(Color32::WHITE);
+        style.visuals.panel_fill = COLOR_BG_DARK;
+        style.visuals.window_fill = COLOR_BG_DARK;
         ctx.set_style(style);
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(8.0, 10.0);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().inner_margin(0.0))
+            .show(ctx, |ui| {
+                let full_rect = ui.max_rect();
 
-            // 1. Header Bar
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("FRAMEPACER")
-                        .font(FontId::monospace(17.0))
-                        .strong()
-                        .color(COLOR_CYAN),
-                );
-                ui.label(
-                    RichText::new("// THE FREAK")
-                        .font(FontId::monospace(14.0))
-                        .color(COLOR_EMERALD),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new("v0.1.0")
-                            .font(FontId::monospace(11.0))
-                            .color(COLOR_TEXT_MUTED),
+                // A. Full-bleed GIF Canvas (zero black bars, exact aspect ratio)
+                let gif_tex = self.gif_player.update_and_get_texture(ctx);
+                if let Some(tex) = gif_tex {
+                    let base_tint = if telem.auto_enabled {
+                        Color32::WHITE
+                    } else {
+                        Color32::from_rgb(140, 150, 165)
+                    };
+                    let tint = Color32::from_rgba_unmultiplied(
+                        base_tint.r(),
+                        base_tint.g(),
+                        base_tint.b(),
+                        (255.0 * fade_in) as u8,
                     );
-                });
-            });
-
-            ui.add_space(2.0);
-
-            // 2. Decorative Animated GIF Box
-            let gif_texture = self.gif_player.update_and_get_texture(ctx);
-            egui::Frame::canvas(ui.style())
-                .fill(Color32::from_rgb(14, 17, 24))
-                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(35, 45, 60)))
-                .rounding(Rounding::same(6.0))
-                .inner_margin(4.0)
-                .show(ui, |ui| {
-                    ui.vertical_centered(|ui| {
-                        if let Some(tex) = gif_texture {
-                            let tex_size = tex.size_vec2();
-                            // Scale down proportionally to fit header nicely
-                            let max_height = 140.0;
-                            let aspect = tex_size.x / tex_size.y.max(1.0);
-                            let disp_size = Vec2::new(max_height * aspect, max_height);
-                            ui.image((tex.id(), disp_size));
-                        } else {
-                            ui.label("KAINE_CRY_ASSET_LOADING...");
-                        }
-                    });
-                });
-
-            ui.add_space(4.0);
-
-            // 3. Telemetry Matrix (Main Card)
-            egui::Frame::group(ui.style())
-                .fill(COLOR_CARD)
-                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(40, 50, 70)))
-                .rounding(Rounding::same(8.0))
-                .inner_margin(12.0)
-                .show(ui, |ui| {
-                    // Digital FPS Readout
-                    ui.columns(2, |cols| {
-                        // Left: Target Cap
-                        cols[0].vertical_centered(|ui| {
-                            ui.label(
-                                RichText::new("TARGET CAP")
-                                    .font(FontId::monospace(10.0))
-                                    .color(COLOR_TEXT_MUTED),
-                            );
-                            ui.label(
-                                RichText::new(format!("{}", telem.current_cap))
-                                    .font(FontId::monospace(36.0))
-                                    .strong()
-                                    .color(COLOR_CYAN),
-                            );
-                            ui.label(
-                                RichText::new("FPS")
-                                    .font(FontId::monospace(10.0))
-                                    .color(COLOR_TEXT_MUTED),
-                            );
-                        });
-
-                        // Right: Live ETW Measured FPS
-                        cols[1].vertical_centered(|ui| {
-                            ui.label(
-                                RichText::new("MEASURED")
-                                    .font(FontId::monospace(10.0))
-                                    .color(COLOR_TEXT_MUTED),
-                            );
-                            let (measured_str, measured_color) =
-                                match (telem.measured_fps, telem.etw_active) {
-                                    (Some(fps), _) => (format!("{:.1}", fps), COLOR_EMERALD),
-                                    (None, true) => ("--.-".to_string(), COLOR_TEXT_MUTED),
-                                    (None, false) => ("OFFLINE".to_string(), COLOR_AMBER),
-                                };
-                            ui.label(
-                                RichText::new(measured_str)
-                                    .font(FontId::monospace(36.0))
-                                    .strong()
-                                    .color(measured_color),
-                            );
-                            let etw_tag = if telem.etw_active {
-                                "ETW DXGI"
-                            } else {
-                                "RUN ELEVATED"
-                            };
-                            ui.label(
-                                RichText::new(etw_tag)
-                                    .font(FontId::monospace(10.0))
-                                    .color(COLOR_TEXT_MUTED),
-                            );
-                        });
-                    });
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-
-                    // Pacing Engine Status Chip
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("STATE:")
-                                .font(FontId::monospace(11.0))
-                                .color(COLOR_TEXT_MUTED),
-                        );
-                        let status_color = if telem.in_drop_state {
-                            COLOR_AMBER
-                        } else if telem.pacing_status.contains("PROB") {
-                            COLOR_CYAN
-                        } else if telem.pacing_status.contains("LOCKED")
-                            || telem.pacing_status.contains("ACTIVE")
-                        {
-                            COLOR_EMERALD
-                        } else {
-                            COLOR_TEXT_MUTED
-                        };
-                        ui.label(
-                            RichText::new(&telem.pacing_status)
-                                .font(FontId::monospace(11.0))
-                                .strong()
-                                .color(status_color),
-                        );
-                    });
-
-                    // Attached Game Info
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("TARGET:")
-                                .font(FontId::monospace(11.0))
-                                .color(COLOR_TEXT_MUTED),
-                        );
-                        let game_str = match (&telem.active_game_name, telem.active_game_pid) {
-                            (Some(name), Some(pid)) => format!("{} [PID {}]", name, pid),
-                            (Some(name), None) => name.clone(),
-                            _ => "WAITING FOR HOOK...".to_string(),
-                        };
-                        let game_color = if telem.active_game_name.is_some() {
-                            Color32::WHITE
-                        } else {
-                            COLOR_TEXT_MUTED
-                        };
-                        ui.label(
-                            RichText::new(game_str)
-                                .font(FontId::monospace(11.0))
-                                .color(game_color),
-                        );
-                    });
-
-                    // IPC Link
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("IPC:")
-                                .font(FontId::monospace(11.0))
-                                .color(COLOR_TEXT_MUTED),
-                        );
-                        let (ipc_str, ipc_color) = if telem.ipc_connected {
-                            ("SHARED MEMORY [ONLINE]", COLOR_EMERALD)
-                        } else {
-                            ("SEARCHING IPC_v5...", COLOR_CRIMSON)
-                        };
-                        ui.label(
-                            RichText::new(ipc_str)
-                                .font(FontId::monospace(10.0))
-                                .color(ipc_color),
-                        );
-                    });
-                });
-
-            ui.add_space(6.0);
-
-            // 4. Controls Section
-            let toggle_text = if telem.auto_enabled {
-                "AUTO PACING: ACTIVE [NEVER-OFF]"
-            } else {
-                "AUTO PACING: PAUSED"
-            };
-            let toggle_color = if telem.auto_enabled {
-                COLOR_EMERALD
-            } else {
-                COLOR_CRIMSON
-            };
-
-            let toggle_btn = egui::Button::new(
-                RichText::new(toggle_text)
-                    .font(FontId::monospace(13.0))
-                    .strong()
-                    .color(toggle_color),
-            )
-            .min_size(Vec2::new(ui.available_width(), 38.0))
-            .stroke(Stroke::new(1.0_f32, toggle_color));
-
-            if ui.add(toggle_btn).clicked() {
-                let _ = self.command_sender.send(UiCommand::ToggleAuto);
-            }
-
-            ui.add_space(4.0);
-
-            // Manual Nudge Buttons
-            ui.horizontal(|ui| {
-                let btn_down = egui::Button::new(
-                    RichText::new("-5 FPS")
-                        .font(FontId::monospace(11.0))
-                        .color(COLOR_CYAN),
-                )
-                .min_size(Vec2::new(ui.available_width() * 0.5 - 4.0, 28.0));
-
-                if ui.add(btn_down).clicked() {
-                    let _ = self.command_sender.send(UiCommand::NudgeCap(-5));
+                    let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+                    ui.painter().image(tex.id(), full_rect, uv, tint);
                 }
 
-                let btn_up = egui::Button::new(
-                    RichText::new("+5 FPS")
-                        .font(FontId::monospace(11.0))
-                        .color(COLOR_CYAN),
-                )
-                .min_size(Vec2::new(ui.available_width(), 28.0));
-
-                if ui.add(btn_up).clicked() {
-                    let _ = self.command_sender.send(UiCommand::NudgeCap(5));
+                // B. Soft Perimeter Vignette (NieR Replicant / Cieris Somnia style)
+                for i in 0..10 {
+                    let inset_rect = full_rect.shrink(i as f32);
+                    let v_alpha = (((10 - i) as f32 * 2.8) * fade_in) as u8;
+                    ui.painter().rect_stroke(
+                        inset_rect,
+                        Rounding::ZERO,
+                        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(8, 10, 14, v_alpha)),
+                    );
                 }
+
+                // C. Subtle Procedural Film Grain Overlay (~12 fps flicker)
+                let grain_time = (ctx.input(|i| i.time) * 12.0) as u32;
+                for i in 0..48 {
+                    let hx = ((i * 1103515245 + grain_time * 12345) & 0x7fffffff) as f32;
+                    let hy = ((i * 214013 + grain_time * 2531011) & 0x7fffffff) as f32;
+                    let gx = full_rect.min.x + (hx % 300.0);
+                    let gy = full_rect.min.y + (hy % 228.0);
+                    let g_alpha = ((5 + (i % 7)) as f32 * fade_in) as u8;
+                    ui.painter().rect_filled(
+                        Rect::from_min_size(Pos2::new(gx, gy), Vec2::new(1.0, 1.0)),
+                        Rounding::ZERO,
+                        Color32::from_rgba_unmultiplied(180, 205, 230, g_alpha),
+                    );
+                }
+
+                // D. Four Thin Hairline Corner Brackets (┌ ┐ └ ┘)
+                let corner_len = 6.0;
+                let corner_inset = 2.5;
+                let corner_col =
+                    Color32::from_rgba_unmultiplied(74, 91, 109, (150.0 * fade_in) as u8);
+                let corner_stroke = Stroke::new(1.0_f32, corner_col);
+
+                // Top-left ┌
+                let tl = full_rect.min + Vec2::new(corner_inset, corner_inset);
+                ui.painter()
+                    .line_segment([tl, tl + Vec2::new(corner_len, 0.0)], corner_stroke);
+                ui.painter()
+                    .line_segment([tl, tl + Vec2::new(0.0, corner_len)], corner_stroke);
+
+                // Top-right ┐
+                let tr = Pos2::new(
+                    full_rect.max.x - corner_inset,
+                    full_rect.min.y + corner_inset,
+                );
+                ui.painter()
+                    .line_segment([tr, tr + Vec2::new(-corner_len, 0.0)], corner_stroke);
+                ui.painter()
+                    .line_segment([tr, tr + Vec2::new(0.0, corner_len)], corner_stroke);
+
+                // Bottom-left └
+                let bl = Pos2::new(
+                    full_rect.min.x + corner_inset,
+                    full_rect.max.y - corner_inset,
+                );
+                ui.painter()
+                    .line_segment([bl, bl + Vec2::new(corner_len, 0.0)], corner_stroke);
+                ui.painter()
+                    .line_segment([bl, bl + Vec2::new(0.0, -corner_len)], corner_stroke);
+
+                // Bottom-right ┘
+                let br = full_rect.max - Vec2::new(corner_inset, corner_inset);
+                ui.painter()
+                    .line_segment([br, br + Vec2::new(-corner_len, 0.0)], corner_stroke);
+                ui.painter()
+                    .line_segment([br, br + Vec2::new(0.0, -corner_len)], corner_stroke);
+
+                // E. Sharp 90° Outer 1px Border
+                ui.painter().rect_stroke(
+                    full_rect,
+                    Rounding::ZERO,
+                    Stroke::new(1.0_f32, COLOR_BORDER),
+                );
+
+                // F. Interactive Control Rectangles (Active only on Hover)
+                let sigil_center = Pos2::new(full_rect.min.x + 20.0, full_rect.min.y + 20.0);
+                let sigil_rect = Rect::from_center_size(sigil_center, Vec2::new(26.0, 26.0));
+
+                let min_center = Pos2::new(full_rect.max.x - 30.0, full_rect.min.y + 16.0);
+                let min_rect = Rect::from_center_size(min_center, Vec2::new(16.0, 16.0));
+
+                let close_center = Pos2::new(full_rect.max.x - 14.0, full_rect.min.y + 16.0);
+                let close_rect = Rect::from_center_size(close_center, Vec2::new(16.0, 16.0));
+
+                let (sigil_resp, min_resp, close_resp) = if has_pointer && hover_alpha > 0.1 {
+                    (
+                        ui.allocate_rect(sigil_rect, egui::Sense::click()),
+                        ui.allocate_rect(min_rect, egui::Sense::click()),
+                        ui.allocate_rect(close_rect, egui::Sense::click()),
+                    )
+                } else {
+                    (
+                        ui.allocate_rect(Rect::NOTHING, egui::Sense::hover()),
+                        ui.allocate_rect(Rect::NOTHING, egui::Sense::hover()),
+                        ui.allocate_rect(Rect::NOTHING, egui::Sense::hover()),
+                    )
+                };
+
+                // Window dragging anywhere on unhovered canvas or non-interactive areas
+                if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
+                    let on_interactive = hover_alpha > 0.1
+                        && (sigil_rect.contains(pos)
+                            || min_rect.contains(pos)
+                            || close_rect.contains(pos));
+                    if !on_interactive && ctx.input(|i| i.pointer.primary_pressed()) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                }
+
+                // Handle cursor style
+                if sigil_resp.hovered() || min_resp.hovered() || close_resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+
+                // Handle control clicks
+                if sigil_resp.clicked() {
+                    let _ = self.command_sender.send(UiCommand::ToggleAuto);
+                    if let Ok(mut t) = self.telemetry.lock() {
+                        t.auto_enabled = !t.auto_enabled;
+                    }
+                }
+                if min_resp.clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+                if close_resp.clicked() {
+                    if let Some(pos) = self.last_seen_pos {
+                        save_window_position(pos);
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+
+                // G. Render Hover-Only Controls when hover_alpha > 0.0
+                if hover_alpha > 0.01 {
+                    // 1. Auto Toggle Sigil (Geometric NieR Rune)
+                    let r_outer = 8.0;
+                    let is_sigil_hovered = sigil_resp.hovered();
+
+                    // Optional pulse flicker if measuring native
+                    let sigil_pulse = if telem.is_measuring_native {
+                        0.5 + 0.5 * (ctx.input(|i| i.time) * 16.0).sin().abs() as f32
+                    } else {
+                        1.0
+                    };
+
+                    if telem.auto_enabled {
+                        let halo_alpha_1 = ((if is_sigil_hovered { 45.0 } else { 24.0 })
+                            * hover_alpha
+                            * sigil_pulse) as u8;
+                        let halo_alpha_2 = ((if is_sigil_hovered { 75.0 } else { 48.0 })
+                            * hover_alpha
+                            * sigil_pulse) as u8;
+
+                        ui.painter().circle_filled(
+                            sigil_center,
+                            13.0,
+                            Color32::from_rgba_unmultiplied(126, 174, 196, halo_alpha_1),
+                        );
+                        ui.painter().circle_filled(
+                            sigil_center,
+                            10.0,
+                            Color32::from_rgba_unmultiplied(126, 174, 196, halo_alpha_2),
+                        );
+
+                        // Outer diamond contour
+                        let p_top = sigil_center + Vec2::new(0.0, -r_outer);
+                        let p_right = sigil_center + Vec2::new(r_outer, 0.0);
+                        let p_bottom = sigil_center + Vec2::new(0.0, r_outer);
+                        let p_left = sigil_center + Vec2::new(-r_outer, 0.0);
+
+                        let stroke_base = if is_sigil_hovered {
+                            COLOR_LUNAR_GLOW_BRIGHT
+                        } else {
+                            COLOR_LUNAR_CYAN
+                        };
+                        let stroke_col = Color32::from_rgba_unmultiplied(
+                            stroke_base.r(),
+                            stroke_base.g(),
+                            stroke_base.b(),
+                            (255.0 * hover_alpha * sigil_pulse) as u8,
+                        );
+                        let stroke = Stroke::new(1.2_f32, stroke_col);
+                        ui.painter().line_segment([p_top, p_right], stroke);
+                        ui.painter().line_segment([p_right, p_bottom], stroke);
+                        ui.painter().line_segment([p_bottom, p_left], stroke);
+                        ui.painter().line_segment([p_left, p_top], stroke);
+
+                        // Inner geometric ring
+                        ui.painter().circle_stroke(
+                            sigil_center,
+                            4.0,
+                            Stroke::new(
+                                1.0_f32,
+                                Color32::from_rgba_unmultiplied(
+                                    164,
+                                    200,
+                                    217,
+                                    (180.0 * hover_alpha) as u8,
+                                ),
+                            ),
+                        );
+
+                        // Central core
+                        let core_col = if is_sigil_hovered {
+                            Color32::from_rgba_unmultiplied(
+                                255,
+                                255,
+                                255,
+                                (255.0 * hover_alpha) as u8,
+                            )
+                        } else {
+                            Color32::from_rgba_unmultiplied(
+                                225,
+                                245,
+                                255,
+                                (220.0 * hover_alpha) as u8,
+                            )
+                        };
+                        ui.painter().circle_filled(sigil_center, 1.6, core_col);
+                    } else {
+                        // Dormant iron sigil
+                        let p_top = sigil_center + Vec2::new(0.0, -r_outer);
+                        let p_right = sigil_center + Vec2::new(r_outer, 0.0);
+                        let p_bottom = sigil_center + Vec2::new(0.0, r_outer);
+                        let p_left = sigil_center + Vec2::new(-r_outer, 0.0);
+
+                        let stroke_col = Color32::from_rgba_unmultiplied(
+                            COLOR_DIM_IRON.r(),
+                            COLOR_DIM_IRON.g(),
+                            COLOR_DIM_IRON.b(),
+                            (220.0 * hover_alpha) as u8,
+                        );
+                        let stroke = Stroke::new(1.0_f32, stroke_col);
+                        ui.painter().line_segment([p_top, p_right], stroke);
+                        ui.painter().line_segment([p_right, p_bottom], stroke);
+                        ui.painter().line_segment([p_bottom, p_left], stroke);
+                        ui.painter().line_segment([p_left, p_top], stroke);
+
+                        ui.painter().circle_stroke(
+                            sigil_center,
+                            4.0,
+                            Stroke::new(
+                                0.8_f32,
+                                Color32::from_rgba_unmultiplied(
+                                    30,
+                                    36,
+                                    44,
+                                    (200.0 * hover_alpha) as u8,
+                                ),
+                            ),
+                        );
+                        ui.painter().circle_filled(
+                            sigil_center,
+                            1.4,
+                            Color32::from_rgba_unmultiplied(
+                                COLOR_DIM_IRON_CORE.r(),
+                                COLOR_DIM_IRON_CORE.g(),
+                                COLOR_DIM_IRON_CORE.b(),
+                                (200.0 * hover_alpha) as u8,
+                            ),
+                        );
+                    }
+
+                    // 2. Minimize Glyph (Hairline bar)
+                    let min_alpha = if min_resp.hovered() { 240.0 } else { 130.0 };
+                    let min_col = Color32::from_rgba_unmultiplied(
+                        180,
+                        200,
+                        220,
+                        (min_alpha * hover_alpha) as u8,
+                    );
+                    ui.painter().line_segment(
+                        [
+                            min_center + Vec2::new(-3.5, 0.0),
+                            min_center + Vec2::new(3.5, 0.0),
+                        ],
+                        Stroke::new(1.0_f32, min_col),
+                    );
+
+                    // 3. Close Glyph (Hairline cross)
+                    let close_alpha = if close_resp.hovered() { 240.0 } else { 130.0 };
+                    let close_col = Color32::from_rgba_unmultiplied(
+                        220,
+                        190,
+                        190,
+                        (close_alpha * hover_alpha) as u8,
+                    );
+                    let cs = 3.0;
+                    ui.painter().line_segment(
+                        [
+                            close_center + Vec2::new(-cs, -cs),
+                            close_center + Vec2::new(cs, cs),
+                        ],
+                        Stroke::new(1.0_f32, close_col),
+                    );
+                    ui.painter().line_segment(
+                        [
+                            close_center + Vec2::new(-cs, cs),
+                            close_center + Vec2::new(cs, -cs),
+                        ],
+                        Stroke::new(1.0_f32, close_col),
+                    );
+                }
+
+                // H. Bottom-Right: Thin, Faint Moonbeam FPS Numeral (Zero words, NO backing box)
+                let numeral_str = match telem.measured_fps {
+                    Some(fps) if fps > 0.0 => format!("{:.0}", fps),
+                    _ => "—".to_string(),
+                };
+
+                // Brief glyph flicker or number fade while the limiter-off benchmark runs
+                let pulse_flicker = if telem.is_measuring_native {
+                    0.35 + 0.35 * (ctx.input(|i| i.time) * 18.0).sin().abs() as f32
+                } else {
+                    1.0
+                };
+
+                let base_num_alpha = if telem.auto_enabled { 130.0 } else { 65.0 };
+                let num_alpha = ((base_num_alpha * pulse_flicker * fade_in) as u8).max(10);
+                let num_color = Color32::from_rgba_unmultiplied(
+                    COLOR_LUNAR_SILVER.r(),
+                    COLOR_LUNAR_SILVER.g(),
+                    COLOR_LUNAR_SILVER.b(),
+                    num_alpha,
+                );
+
+                let font_id = FontId::new(13.0, egui::FontFamily::Proportional);
+                let galley = ui.painter().layout_no_wrap(numeral_str, font_id, num_color);
+
+                let margin_right = 10.0;
+                let margin_bottom = 8.0;
+                let text_pos = Pos2::new(
+                    full_rect.max.x - margin_right - galley.size().x,
+                    full_rect.max.y - margin_bottom - galley.size().y,
+                );
+
+                // Render faint numeral directly on canvas (no backing box or pill)
+                ui.painter().galley(text_pos, galley, num_color);
             });
 
-            ui.add_space(4.0);
-
-            // 5. Footer & Quote
-            ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-                ui.label(
-                    RichText::new("*Glory to mankind.*")
-                        .font(FontId::monospace(10.0))
-                        .italics()
-                        .color(Color32::from_rgb(90, 105, 125)),
-                );
-                ui.label(
-                    RichText::new("Toggle Hotkey: Alt + Shift + A")
-                        .font(FontId::monospace(9.0))
-                        .color(COLOR_TEXT_MUTED),
-                );
-            });
-        });
-
-        // Request constant 30-60 Hz repainting for smooth cyber animation
-        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        // Request continuous repaint for smooth GIF playback and animation
+        ctx.request_repaint_after(Duration::from_millis(33));
     }
 }
 
@@ -344,18 +536,41 @@ pub fn run_gui(
     telemetry: Arc<Mutex<UiTelemetry>>,
     command_sender: std::sync::mpsc::Sender<UiCommand>,
 ) -> Result<(), eframe::Error> {
+    let mut builder = egui::ViewportBuilder::default()
+        .with_inner_size([300.0, 228.0])
+        .with_min_inner_size([300.0, 228.0])
+        .with_max_inner_size([300.0, 228.0])
+        .with_resizable(false)
+        .with_decorations(false)
+        .with_always_on_top()
+        .with_title("THE FREAK");
+
+    if let Some([x, y]) = load_window_position() {
+        builder = builder.with_position([x, y]);
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([360.0, 520.0])
-            .with_min_inner_size([320.0, 480.0])
-            .with_always_on_top()
-            .with_title("FRAMEPACER // THE FREAK"),
+        viewport: builder,
         ..Default::default()
     };
 
     eframe::run_native(
         "framepacer-the-freak",
         native_options,
-        Box::new(|_cc| Ok(Box::new(CyberApp::new(telemetry, command_sender)))),
+        Box::new(|_cc| Ok(Box::new(FreakApp::new(telemetry, command_sender)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_window_position_serde() {
+        let pos = WindowPosition { x: 240.5, y: 180.0 };
+        let json = serde_json::to_string(&pos).expect("serialize");
+        let decoded: WindowPosition = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.x, 240.5);
+        assert_eq!(decoded.y, 180.0);
+    }
 }

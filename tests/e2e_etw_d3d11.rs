@@ -7,6 +7,14 @@ use std::time::Duration;
 fn test_realtime_etw_dxgi_present_capture() {
     let recorder = get_global_recorder();
 
+    // Stop any leftover sessions that might hold exclusive provider handles
+    let _ = std::process::Command::new("logman")
+        .args(["stop", "FramePacerTheFreakETW", "-ets"])
+        .output();
+    let _ = std::process::Command::new("logman")
+        .args(["stop", "FPAutoE2ETestTrace", "-ets"])
+        .output();
+
     // Start ETW trace session with DXGI provider enabled at Verbose level 5
     let session = match EtwTraceSession::start("FPAutoE2ETestTrace") {
         Ok(s) => s,
@@ -19,18 +27,21 @@ fn test_realtime_etw_dxgi_present_capture() {
         }
     };
 
-    // Locate release or debug binary of fp-testgame
-    let exe_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    // Locate release or debug binary of fp-testgame based on build configuration
+    let debug_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
-        .join("release");
-    let testgame_path = exe_dir.join("fp-testgame.exe");
-    let exe = if testgame_path.exists() {
-        testgame_path
+        .join("debug")
+        .join("fp-testgame.exe");
+    let release_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("release")
+        .join("fp-testgame.exe");
+    let exe = if cfg!(debug_assertions) && debug_path.exists() {
+        debug_path
+    } else if release_path.exists() {
+        release_path
     } else {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("debug")
-            .join("fp-testgame.exe")
+        debug_path
     };
 
     let mut child = Command::new(&exe)

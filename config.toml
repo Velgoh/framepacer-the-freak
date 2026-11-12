@@ -8,8 +8,11 @@ max_fps = 200
 # FPS adjustment step (FramePacer adjusts in 5 FPS steps)
 step_fps = 5
 
-# Flatline duration (in seconds) of stable frametimes before probing +5 FPS
-stable_recheck_interval_secs = 8.0
+# Periodic benchmark interval (in seconds): turn limiter off briefly to sample native FPS
+stable_recheck_interval_secs = 30.0
+
+# Benchmark measurement pulse duration (in seconds)
+measure_duration_secs = 1.0
 
 # Faster probe interval (in seconds) in cutscenes to detect when gameplay resumes
 drop_recheck_interval_secs = 4.0

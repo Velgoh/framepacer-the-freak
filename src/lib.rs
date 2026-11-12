@@ -6,5 +6,4 @@ pub mod hotkey;
 pub mod ipc;
 pub mod logparse;
 pub mod logtail;
-pub mod tray;
 pub mod ui;

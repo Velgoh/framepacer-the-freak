@@ -53,10 +53,10 @@ fn default_step_fps() -> u32 {
     5
 }
 fn default_measure_duration_secs() -> f64 {
-    1.5
+    1.0
 }
 fn default_stable_recheck_interval_secs() -> f64 {
-    8.0
+    30.0
 }
 fn default_drop_recheck_interval_secs() -> f64 {
     4.0

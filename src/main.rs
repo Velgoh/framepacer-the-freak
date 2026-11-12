@@ -1,6 +1,9 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use framepacer_the_freak::analyzer::{AutoState, PacingAction, PacingAnalyzer};
 use framepacer_the_freak::config::AppConfig;
 use framepacer_the_freak::etw::{EtwTraceSession, get_global_recorder};
+use framepacer_the_freak::hotkey::check_toggle_hotkey;
 use framepacer_the_freak::ipc::FramepacerIpc;
 use framepacer_the_freak::logtail::LogTailer;
 use framepacer_the_freak::ui::{UiCommand, UiTelemetry, run_gui};
@@ -13,7 +16,6 @@ use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU, VK_SHIFT};
 
 fn get_process_name_by_pid(pid: u32) -> Option<String> {
     unsafe {
@@ -60,8 +62,6 @@ struct EngineController {
     telemetry: Arc<Mutex<UiTelemetry>>,
     cmd_rx: Receiver<UiCommand>,
     hotkey_was_down: bool,
-    probing_state: Option<(u32, u32, Instant)>,
-    probe_cooldown_until: Option<Instant>,
     last_ipc_retry: Instant,
 }
 
@@ -101,8 +101,6 @@ impl EngineController {
             telemetry,
             cmd_rx,
             hotkey_was_down: false,
-            probing_state: None,
-            probe_cooldown_until: None,
             last_ipc_retry: Instant::now(),
         }
     }
@@ -138,58 +136,9 @@ impl EngineController {
         }
     }
 
-    fn nudge_cap(&mut self, delta: i32) {
-        if let Some(game) = self.active_game.as_mut() {
-            let new_cap = if delta < 0 {
-                game.current_cap.saturating_sub((-delta) as u32)
-            } else {
-                game.current_cap.saturating_add(delta as u32)
-            }
-            .clamp(self.config.min_fps, self.config.max_fps);
-
-            println!(
-                "[NUDGE] Manual cap adjustment: {} -> {} FPS",
-                game.current_cap, new_cap
-            );
-            let _ = self.ipc.set_target_fps(new_cap);
-            game.current_cap = new_cap;
-            self.probing_state = None;
-            self.probe_cooldown_until = None;
-            game.state = AutoState::Settling {
-                cap_fps: new_cap,
-                settle_until: Instant::now() + Duration::from_millis(1500),
-                in_drop_state: new_cap < game.initial_cap,
-            };
-        } else if self.ipc.is_connected() {
-            let current = self.ipc.get_target_fps().unwrap_or(60);
-            let new_cap = if delta < 0 {
-                current.saturating_sub((-delta) as u32)
-            } else {
-                current.saturating_add(delta as u32)
-            }
-            .clamp(self.config.min_fps, self.config.max_fps);
-
-            println!(
-                "[NUDGE] Manual idle cap adjustment: {} -> {} FPS",
-                current, new_cap
-            );
-            let _ = self.ipc.set_target_fps(new_cap);
-        }
-    }
-
     fn poll_hotkey(&mut self) {
-        // Global hotkey: Alt + Shift + A (0x41)
-        unsafe {
-            let alt_down = (GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
-            let shift_down = (GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
-            let a_key = GetAsyncKeyState(0x41) as u16;
-            let a_down = (a_key & 0x8001) != 0;
-
-            let is_down = alt_down && shift_down && a_down;
-            if is_down && !self.hotkey_was_down {
-                self.toggle_auto();
-            }
-            self.hotkey_was_down = is_down;
+        if check_toggle_hotkey(&mut self.hotkey_was_down) {
+            self.toggle_auto();
         }
     }
 
@@ -201,7 +150,6 @@ impl EngineController {
         while let Ok(cmd) = self.cmd_rx.try_recv() {
             match cmd {
                 UiCommand::ToggleAuto => self.toggle_auto(),
-                UiCommand::NudgeCap(delta) => self.nudge_cap(delta),
             }
         }
 
@@ -213,8 +161,29 @@ impl EngineController {
             let _ = self.ipc.connect();
         }
 
-        // Direct IPC game discovery (independent of log file location)
+        // Direct IPC game discovery & live manual cap tracking
         if self.ipc.is_connected() {
+            if let Some(game) = self.active_game.as_mut() {
+                // Continuous live sync with FramePacer's shared memory target FPS.
+                // Detects instant manual cap changes applied by user in FramePacer GUI (e.g. typing 49 and Apply).
+                if let Ok(live_fps) = self.ipc.get_target_fps()
+                    && live_fps > 0
+                    && live_fps != game.current_cap
+                {
+                    println!(
+                        "[MANUAL SYNC] External manual cap change in FramePacer: {} -> {} FPS",
+                        game.current_cap, live_fps
+                    );
+                    game.current_cap = live_fps;
+                    game.initial_cap = live_fps;
+                    game.state = AutoState::Settling {
+                        cap_fps: live_fps,
+                        settle_until: now + Duration::from_millis(1500),
+                        in_drop_state: false,
+                    };
+                }
+            }
+
             if self.active_game.is_none() {
                 if let Ok(true) = self.ipc.is_dll_attached() {
                     let pid = self.ipc.get_attached_pid().ok().flatten().unwrap_or(0);
@@ -263,8 +232,6 @@ impl EngineController {
                 println!("[IPC DETACH] Game detached via IPC: {}", game.process_name);
                 let dead_pid = game.pid;
                 self.active_game = None;
-                self.probing_state = None;
-                self.probe_cooldown_until = None;
                 if let Ok(mut rec) = get_global_recorder().lock() {
                     rec.clear_pid(dead_pid);
                 }
@@ -349,8 +316,6 @@ impl EngineController {
                         println!("[DETACH] Game detached: {}", game.process_name);
                         let dead_pid = game.pid;
                         self.active_game = None;
-                        self.probing_state = None;
-                        self.probe_cooldown_until = None;
                         if let Ok(mut rec) = get_global_recorder().lock() {
                             rec.clear_pid(dead_pid);
                         }
@@ -427,39 +392,11 @@ impl EngineController {
                             in_drop_state,
                         );
 
-                        // Suppress ProbeUp if currently in failed-probe ceiling cooldown
-                        let in_cooldown = self
-                            .probe_cooldown_until
-                            .map(|until| now < until)
-                            .unwrap_or(false);
-                        let action = match action {
-                            PacingAction::ProbeUp { .. } if in_cooldown => PacingAction::KeepCap,
-                            other => other,
-                        };
-
                         match action {
                             PacingAction::KeepCap => {}
                             PacingAction::StepDown { from_fps, to_fps } => {
-                                // Check if this stepdown immediately follows an upward probe
-                                if let Some((p_from, p_to, p_time)) = self.probing_state.take()
-                                    && p_to == from_fps
-                                    && to_fps <= p_from
-                                    && now.duration_since(p_time) <= Duration::from_secs(12)
-                                {
-                                    let cooldown_dur = if game.in_drop_state {
-                                        Duration::from_secs(15)
-                                    } else {
-                                        Duration::from_secs(30)
-                                    };
-                                    println!(
-                                        "[PROBE CEILING] Ceiling encountered at {} FPS -> backing off probes for {:?}",
-                                        p_to, cooldown_dur
-                                    );
-                                    self.probe_cooldown_until = Some(now + cooldown_dur);
-                                }
-
                                 println!(
-                                    "[STEP] Framing struggling -> lowering cap {} -> {} FPS",
+                                    "[STEP] Pacing struggling -> lowering cap {} -> {} FPS",
                                     from_fps, to_fps
                                 );
                                 let _ = self.ipc.set_target_fps(to_fps);
@@ -473,8 +410,6 @@ impl EngineController {
                                 });
                             }
                             PacingAction::JumpTo { from_fps, to_fps } => {
-                                self.probing_state = None;
-                                self.probe_cooldown_until = None;
                                 println!(
                                     "[CUTSCENE] Cutscene drop -> snapping cap {} -> {} FPS",
                                     from_fps, to_fps
@@ -488,22 +423,58 @@ impl EngineController {
                                     in_drop_state: true,
                                 });
                             }
-                            PacingAction::ProbeUp { from_fps, to_fps } => {
-                                self.probing_state = Some((from_fps, to_fps, now));
+                            PacingAction::MeasureNative => {
                                 println!(
-                                    "[PROBE] Frametime flat for >= 8s -> probing cap {} -> {} FPS",
-                                    from_fps, to_fps
+                                    "[BENCHMARK] 30s benchmark cycle -> disengaging limiter for 1.0s to measure native FPS"
                                 );
-                                let _ = self.ipc.set_target_fps(to_fps);
-                                game.current_cap = to_fps;
-                                let still_in_drop = to_fps < game.initial_cap;
-                                game.in_drop_state = still_in_drop;
-                                next_state = Some(AutoState::Settling {
-                                    cap_fps: to_fps,
-                                    settle_until: now + Duration::from_millis(1500),
-                                    in_drop_state: still_in_drop,
+                                let _ = self.ipc.set_limiter_enabled(false);
+                                game.limiter_enabled = false;
+                                if let Ok(mut rec) = get_global_recorder().lock() {
+                                    rec.clear_pid(game.pid);
+                                }
+                                next_state = Some(AutoState::MeasuringNative {
+                                    started_at: now,
+                                    previous_cap: cap_fps,
                                 });
                             }
+                        }
+                    }
+                    AutoState::MeasuringNative {
+                        started_at,
+                        previous_cap,
+                    } => {
+                        let elapsed = now.duration_since(started_at);
+                        if elapsed >= Duration::from_secs_f64(self.config.measure_duration_secs) {
+                            let recorder = get_global_recorder();
+                            let measured_fps = recorder.lock().ok().and_then(|rec| {
+                                rec.get_current_fps(
+                                    game.pid,
+                                    Duration::from_secs_f64(self.config.measure_duration_secs),
+                                )
+                            });
+
+                            let new_cap = if let Some(fps) = measured_fps {
+                                self.config.clamp_and_round_fps(fps)
+                            } else {
+                                previous_cap
+                            };
+
+                            println!(
+                                "[BENCHMARK COMPLETE] Measured native: {:?} FPS -> setting cap {} FPS and re-engaging limiter",
+                                measured_fps, new_cap
+                            );
+
+                            let _ = self.ipc.set_target_fps(new_cap);
+                            let _ = self.ipc.set_limiter_enabled(true);
+                            game.current_cap = new_cap;
+                            game.limiter_enabled = true;
+                            let still_in_drop = new_cap < game.initial_cap;
+                            game.in_drop_state = still_in_drop;
+                            next_state = Some(AutoState::Settling {
+                                cap_fps: new_cap,
+                                settle_until: now + Duration::from_millis(1000),
+                                in_drop_state: still_in_drop,
+                            });
                         }
                     }
                 }
@@ -523,11 +494,18 @@ impl EngineController {
             rec.get_current_fps(g.pid, Duration::from_secs(2))
         });
 
+        let is_measuring = self
+            .active_game
+            .as_ref()
+            .map(|g| matches!(g.state, AutoState::MeasuringNative { .. }))
+            .unwrap_or(false);
+
         let (status_str, in_drop) = if !self.auto_enabled {
             ("PAUSED".to_string(), false)
         } else if let Some(game) = &self.active_game {
             match game.state {
                 AutoState::Idle => ("STANDBY".to_string(), false),
+                AutoState::MeasuringNative { .. } => ("BENCHMARKING NATIVE".to_string(), false),
                 AutoState::Settling {
                     in_drop_state: true,
                     ..
@@ -537,19 +515,7 @@ impl EngineController {
                     in_drop_state: true,
                     ..
                 } => ("CUTSCENE SNAP (30 FPS)".to_string(), true),
-                AutoState::PacingActive { stable_since, .. } => {
-                    let in_cooldown = self
-                        .probe_cooldown_until
-                        .map(|until| now < until)
-                        .unwrap_or(false);
-                    if in_cooldown {
-                        ("CEILING LOCKED (STABLE)".to_string(), false)
-                    } else if now.duration_since(stable_since) >= Duration::from_secs(8) {
-                        ("PROBING (+5 FPS)".to_string(), false)
-                    } else {
-                        ("PACING LOCKED".to_string(), false)
-                    }
-                }
+                AutoState::PacingActive { .. } => ("PACING LOCKED".to_string(), false),
             }
         } else {
             ("WAITING FOR GAME...".to_string(), false)
@@ -565,6 +531,7 @@ impl EngineController {
                 .map(|g| g.current_cap)
                 .unwrap_or_else(|| self.ipc.get_target_fps().unwrap_or(60));
             telem.measured_fps = measured_fps;
+            telem.is_measuring_native = is_measuring;
             telem.pacing_status = status_str;
             telem.ipc_connected = self.ipc.is_connected();
             telem.in_drop_state = in_drop;
@@ -597,7 +564,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_dir = exe_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
-    let config_path = config_dir.join("config.toml");
+    let data_config = config_dir.join("data").join("config.toml");
+    let config_path = if data_config.exists() {
+        data_config
+    } else if config_dir.join("config.toml").exists() {
+        config_dir.join("config.toml")
+    } else if config_dir.join("data").is_dir() {
+        data_config
+    } else {
+        config_dir.join("config.toml")
+    };
 
     let telemetry = Arc::new(Mutex::new(UiTelemetry::default()));
     let (cmd_tx, cmd_rx) = channel::<UiCommand>();
