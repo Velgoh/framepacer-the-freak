@@ -132,7 +132,7 @@ cargo clippy --all-targets -- -D warnings
 powershell -ExecutionPolicy Bypass -File scripts\package.ps1
 ```
 
-Packaged output is generated in `dist/` containing `FramePacerCompanion.exe`, `data/`, and `FramePacerCompanion-v0.3.0.zip`.
+Packaged output is generated in `dist/` containing `FramePacerCompanion.exe`, `data/`, and `FramePacerCompanion-v0.3.1.zip`.
 
 ---
 

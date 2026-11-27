@@ -265,7 +265,10 @@ impl PacingAnalyzer {
 
         let total_frames = intervals.len() as f64;
         let late_ratio = (late_count as f64) / total_frames;
-        let is_isolated_spike = max_consecutive_late <= 2 && late_ratio < 0.08;
+        let min_late_streak = ((current_cap as f64) * 0.12).round().clamp(5.0, 20.0) as usize;
+        let effective_late_ratio = self.config.late_frame_threshold_ratio.max(0.08);
+        let is_isolated_spike =
+            max_consecutive_late < min_late_streak.min(4) && late_ratio < effective_late_ratio;
 
         // Compute robust sustained FPS (trimming top/bottom 5% outliers)
         let mut sorted = intervals.to_vec();
@@ -295,7 +298,7 @@ impl PacingAnalyzer {
         // 3. Evaluate downward pressure
         let has_sustained_shortfall = sustained_fps < (current_cap as f64 - 1.5);
         let has_sustained_late_frames = !is_isolated_spike
-            && (late_ratio > self.config.late_frame_threshold_ratio || max_consecutive_late >= 3);
+            && (late_ratio > effective_late_ratio || max_consecutive_late >= min_late_streak);
 
         if has_sustained_shortfall || has_sustained_late_frames {
             if (current_cap as f64 - sustained_fps) >= (self.config.drop_detection_fps as f64) {
@@ -311,7 +314,9 @@ impl PacingAnalyzer {
                 }
             }
 
-            if current_cap > self.config.min_fps {
+            let enough_samples_for_step = intervals.len() >= 20
+                || (intervals.len() >= 10 && sustained_fps < (current_cap as f64 - 3.0));
+            if enough_samples_for_step && current_cap > self.config.min_fps {
                 let target = current_cap
                     .saturating_sub(self.config.step_fps)
                     .max(self.config.min_fps);
@@ -621,7 +626,8 @@ impl PacingAnalyzer {
 
             // Hold zone (near target) or fast recovery / laptop downclocking wake-up nudge
             let nudge_target = (current_cap + step).min(self.config.max_fps);
-            let is_near_limit = gpu_pct >= 93.0 || cpu_pct >= 90.0;
+            let is_near_limit = gpu_pct >= self.config.hold_gpu_util_pct
+                || cpu_pct >= self.config.max_cpu_thread_util_pct;
             let predicted_gpu = gpu_pct * ((nudge_target as f64) / (current_cap.max(1) as f64));
             let below_session_high = ceiling.session_high_cap > current_cap;
             let fast_recovery = below_session_high
@@ -1198,6 +1204,63 @@ mod tests {
         let intervals_85 = vec![1000.0 / 85.0; 60];
         assert_eq!(
             analyzer.evaluate_never_off(85, &intervals_85, &hw_87, &ceiling, now, stable, false),
+            PacingAction::KeepCap
+        );
+    }
+
+    #[test]
+    fn test_high_fps_three_frame_micro_blip_does_not_step_down() {
+        let analyzer = PacingAnalyzer::new(AppConfig::default());
+        let now = Instant::now();
+        let hw = HardwareLoad {
+            gpu_util_pct: Some(90.0),
+            game_gpu_util_pct: Some(90.0),
+            max_cpu_thread_pct: Some(60.0),
+            pdh_available: true,
+        };
+        let mut intervals = vec![1000.0 / 170.0; 200];
+        intervals[100] = 6.5;
+        intervals[101] = 6.5;
+        intervals[102] = 6.5;
+        assert_eq!(
+            analyzer.evaluate_never_off(170, &intervals, &hw, &CeilingTracker::default(), now, now, false),
+            PacingAction::KeepCap
+        );
+    }
+
+    #[test]
+    fn test_small_post_settle_sample_window_does_not_false_step_down() {
+        let analyzer = PacingAnalyzer::new(AppConfig::default());
+        let now = Instant::now();
+        let hw = HardwareLoad {
+            gpu_util_pct: Some(85.0),
+            game_gpu_util_pct: Some(85.0),
+            max_cpu_thread_pct: Some(50.0),
+            pdh_available: true,
+        };
+        // Only 6 samples averaging ~64 FPS at cap 65 -> wait for >= 20 samples
+        let intervals = vec![1000.0 / 64.0; 6];
+        assert_eq!(
+            analyzer.evaluate_never_off(65, &intervals, &hw, &CeilingTracker::default(), now, now, false),
+            PacingAction::KeepCap
+        );
+    }
+
+    #[test]
+    fn test_wakeup_nudge_does_not_fire_at_or_above_hold_gpu() {
+        let analyzer = PacingAnalyzer::new(AppConfig::default());
+        let now = Instant::now();
+        let stable = now - Duration::from_secs(50);
+        let ceiling = CeilingTracker::default();
+        let hw_90 = HardwareLoad {
+            gpu_util_pct: Some(90.0),
+            game_gpu_util_pct: Some(90.0),
+            max_cpu_thread_pct: Some(50.0),
+            pdh_available: true,
+        };
+        let intervals_85 = vec![1000.0 / 85.0; 60];
+        assert_eq!(
+            analyzer.evaluate_never_off(85, &intervals_85, &hw_90, &ceiling, now, stable, false),
             PacingAction::KeepCap
         );
     }

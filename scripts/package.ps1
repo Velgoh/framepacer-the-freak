@@ -1,11 +1,11 @@
-﻿# Automated packaging script for "FramePacer Companion" (v0.3.0)
+﻿# Automated packaging script for "FramePacer Companion" (v0.3.1)
 # Produces a clean distributable layout:
 # dist/
 # ├── FramePacerCompanion.exe
 # ├── data/
 # │   ├── config.toml
 # │   └── window.json
-# └── FramePacerCompanion-v0.3.0.zip
+# └── FramePacerCompanion-v0.3.1.zip
 
 $ErrorActionPreference = "Stop"
 
@@ -53,7 +53,7 @@ Write-Host "`nDistributable successfully assembled in $($distDir):" -ForegroundC
 $preZipItems | ForEach-Object { Write-Host "  - $($_.Name)" }
 
 # Create release zip archive containing FramePacerCompanion.exe and data/
-$zipPath = Join-Path $distDir "FramePacerCompanion-v0.3.0.zip"
+$zipPath = Join-Path $distDir "FramePacerCompanion-v0.3.1.zip"
 Write-Host "`n==> Creating release archive: $zipPath..." -ForegroundColor Cyan
 Compress-Archive -Path $destExe, $dataDir -DestinationPath $zipPath -Force
 

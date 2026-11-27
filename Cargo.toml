@@ -1,6 +1,6 @@
 [package]
 name = "framepacer-the-freak"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Automatic FPS cap companion for Steam's FramePacer (Never-Off GPU/CPU headroom pacing)."
 default-run = "framepacer-the-freak"

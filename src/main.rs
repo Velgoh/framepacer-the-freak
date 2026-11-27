@@ -441,7 +441,9 @@ impl EngineController {
             samples
         };
 
-        if ipc_intervals.len() >= 5 && ipc_intervals.len() >= etw_intervals.len() {
+        if ipc_intervals.len() >= 15
+            || (ipc_intervals.len() >= 5 && ipc_intervals.len() >= etw_intervals.len())
+        {
             (ipc_intervals, "ipc")
         } else if etw_intervals.len() >= 5 {
             (etw_intervals, "etw")
@@ -478,7 +480,9 @@ impl EngineController {
             samples[samples.len() - take..].to_vec()
         };
 
-        if ipc_intervals.len() >= 5 && ipc_intervals.len() >= etw_intervals.len() {
+        if ipc_intervals.len() >= 10
+            || (ipc_intervals.len() >= 5 && ipc_intervals.len() >= etw_intervals.len())
+        {
             (ipc_intervals, "ipc")
         } else if etw_intervals.len() >= 5 {
             (etw_intervals, "etw")
@@ -932,13 +936,25 @@ impl EngineController {
                             PacingAction::StepDown { from_fps, to_fps } => {
                                 let avg_fps = PacingAnalyzer::summarize_intervals(&intervals)
                                     .unwrap_or(0.0);
+                                let hw_pegged = hw
+                                    .gpu_util_pct
+                                    .is_some_and(|g| g >= self.config.hold_gpu_util_pct)
+                                    || hw
+                                        .max_cpu_thread_pct
+                                        .is_some_and(|c| c >= self.config.max_cpu_thread_util_pct);
+                                let still_in_drop = to_fps <= 35
+                                    || (game.in_drop_state && to_fps <= 65 && !hw_pegged);
                                 let _ = self.ipc.set_target_fps(to_fps);
-                                self.ceiling.record_step_down_ceiling(
-                                    from_fps,
-                                    to_fps,
-                                    hw.gpu_util_pct,
-                                    now,
-                                );
+                                if still_in_drop && !hw_pegged {
+                                    self.ceiling.on_step_down(to_fps);
+                                } else {
+                                    self.ceiling.record_step_down_ceiling(
+                                        from_fps,
+                                        to_fps,
+                                        hw.gpu_util_pct,
+                                        now,
+                                    );
+                                }
                                 log_info(format!(
                                     "[STEP] Pacing struggling -> lowering cap {} -> {} FPS (avg_fps={:.1}, samples={}, src={}, gpu={}, cpu_thr={}, backoff={:.0}s)",
                                     from_fps,
@@ -951,7 +967,6 @@ impl EngineController {
                                     self.ceiling.backoff_secs
                                 ));
                                 game.current_cap = to_fps;
-                                let still_in_drop = game.in_drop_state || to_fps <= 35;
                                 game.in_drop_state = still_in_drop;
                                 next_state = Some(AutoState::Settling {
                                     cap_fps: to_fps,
@@ -969,7 +984,9 @@ impl EngineController {
                                         .max_cpu_thread_pct
                                         .is_some_and(|c| c >= self.config.max_cpu_thread_util_pct);
                                 let is_cutscene = to_fps <= 35
-                                    || (!hw_pegged && self.ceiling.session_high_cap > to_fps);
+                                    || (to_fps <= 65
+                                        && !hw_pegged
+                                        && self.ceiling.session_high_cap > to_fps);
                                 if is_cutscene {
                                     log_info(format!(
                                         "[CUTSCENE] Cutscene drop -> snapping cap {} -> {} FPS (avg_fps={:.1}, samples={}, src={}, gpu={}, cpu_thr={})",
@@ -1128,8 +1145,19 @@ impl EngineController {
                                 game.current_cap = previous_cap;
                                 let step = self.config.step_fps.max(1);
                                 let next_step = (previous_cap + step).min(self.config.max_fps);
-                                if eval.is_software_lock {
-                                    let is_temporary = in_drop_state
+                                let hw_pegged = hw
+                                    .gpu_util_pct
+                                    .is_some_and(|g| g >= self.config.hold_gpu_util_pct)
+                                    || hw
+                                        .max_cpu_thread_pct
+                                        .is_some_and(|c| c >= self.config.max_cpu_thread_util_pct);
+                                let cutscene_transition_retry = in_drop_state
+                                    && reason == "cutscene_probe"
+                                    && !hw_pegged
+                                    && eval.sustained_fps >= (previous_cap as f64 - 2.0);
+                                if eval.is_software_lock || cutscene_transition_retry {
+                                    let is_temporary = cutscene_transition_retry
+                                        || in_drop_state
                                         || previous_cap < self.ceiling.session_high_cap;
                                     self.ceiling.record_software_lock(
                                         previous_cap,
@@ -1138,14 +1166,20 @@ impl EngineController {
                                         hw.gpu_util_pct,
                                         now,
                                     );
+                                    let kind_label = if eval.is_software_lock {
+                                        "soft_lock"
+                                    } else {
+                                        "cutscene_retry"
+                                    };
                                     log_info(format!(
-                                        "[PROBE REVERT] ({}) {} -> {} FPS (measured={:.1}, samples={}, src={}, kind=soft_lock, temp={}, blocked={}, gpu={}, cpu_thr={}, backoff={:.0}s)",
+                                        "[PROBE REVERT] ({}) {} -> {} FPS (measured={:.1}, samples={}, src={}, kind={}, temp={}, blocked={}, gpu={}, cpu_thr={}, backoff={:.0}s)",
                                         reason,
                                         probe_cap,
                                         previous_cap,
                                         eval.sustained_fps,
                                         probe_intervals.len(),
                                         probe_src,
+                                        kind_label,
                                         is_temporary,
                                         next_step,
                                         fmt_opt_pct(hw.gpu_util_pct),
@@ -1153,12 +1187,6 @@ impl EngineController {
                                         self.ceiling.backoff_secs
                                     ));
                                 } else {
-                                    let hw_pegged = hw
-                                        .gpu_util_pct
-                                        .is_some_and(|g| g >= self.config.hold_gpu_util_pct)
-                                        || hw
-                                            .max_cpu_thread_pct
-                                            .is_some_and(|c| c >= self.config.max_cpu_thread_util_pct);
                                     let block_cap = if hw_pegged
                                         && eval.sustained_fps >= (next_step as f64)
                                     {
@@ -1425,7 +1453,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     log_info(format!(
-        "=== FRAMEPACER COMPANION v0.3.0 === (elevated={}, config={})",
+        "=== FRAMEPACER COMPANION v0.3.1 === (elevated={}, config={})",
         is_process_elevated(),
         config_path.display()
     ));
