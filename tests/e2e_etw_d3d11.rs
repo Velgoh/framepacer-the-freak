@@ -9,6 +9,9 @@ fn test_realtime_etw_dxgi_present_capture() {
 
     // Stop any leftover sessions that might hold exclusive provider handles
     let _ = std::process::Command::new("logman")
+        .args(["stop", "FramePacerCompanionETW", "-ets"])
+        .output();
+    let _ = std::process::Command::new("logman")
         .args(["stop", "FramePacerTheFreakETW", "-ets"])
         .output();
     let _ = std::process::Command::new("logman")

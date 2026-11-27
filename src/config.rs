@@ -1,8 +1,37 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PacingMode {
+    #[default]
+    NeverOff,
+    Pulse,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub pacing_mode: PacingMode,
+
+    #[serde(default = "default_target_gpu_util_pct")]
+    pub target_gpu_util_pct: f64,
+
+    #[serde(default = "default_hold_gpu_util_pct")]
+    pub hold_gpu_util_pct: f64,
+
+    #[serde(default = "default_scale_up_gpu_util_pct")]
+    pub scale_up_gpu_util_pct: f64,
+
+    #[serde(default = "default_max_cpu_thread_util_pct")]
+    pub max_cpu_thread_util_pct: f64,
+
+    #[serde(default = "default_probe_verify_ms")]
+    pub probe_verify_ms: u64,
+
+    #[serde(default = "default_wakeup_nudge_interval_secs")]
+    pub wakeup_nudge_interval_secs: f64,
+
     #[serde(default = "default_min_fps")]
     pub min_fps: u32,
 
@@ -43,6 +72,24 @@ pub struct AppConfig {
     pub auto_enabled_at_startup: bool,
 }
 
+fn default_target_gpu_util_pct() -> f64 {
+    88.0
+}
+fn default_hold_gpu_util_pct() -> f64 {
+    88.0
+}
+fn default_scale_up_gpu_util_pct() -> f64 {
+    80.0
+}
+fn default_max_cpu_thread_util_pct() -> f64 {
+    85.0
+}
+fn default_probe_verify_ms() -> u64 {
+    500
+}
+fn default_wakeup_nudge_interval_secs() -> f64 {
+    45.0
+}
 fn default_min_fps() -> u32 {
     30
 }
@@ -86,6 +133,13 @@ fn default_auto_enabled_at_startup() -> bool {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            pacing_mode: PacingMode::default(),
+            target_gpu_util_pct: default_target_gpu_util_pct(),
+            hold_gpu_util_pct: default_hold_gpu_util_pct(),
+            scale_up_gpu_util_pct: default_scale_up_gpu_util_pct(),
+            max_cpu_thread_util_pct: default_max_cpu_thread_util_pct(),
+            probe_verify_ms: default_probe_verify_ms(),
+            wakeup_nudge_interval_secs: default_wakeup_nudge_interval_secs(),
             min_fps: default_min_fps(),
             max_fps: default_max_fps(),
             step_fps: default_step_fps(),
@@ -135,6 +189,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let cfg = AppConfig::default();
+        assert_eq!(cfg.pacing_mode, PacingMode::NeverOff);
         assert_eq!(cfg.min_fps, 30);
         assert_eq!(cfg.max_fps, 200);
         assert_eq!(cfg.step_fps, 5);

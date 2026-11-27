@@ -25,6 +25,19 @@ impl LogTailer {
         tailer
     }
 
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub fn set_path(&mut self, new_path: impl Into<PathBuf>, start_at_end: bool) {
+        self.reader = None;
+        self.last_offset = 0;
+        self.path = new_path.into();
+        if start_at_end {
+            self.seek_to_end();
+        }
+    }
+
     pub fn seek_to_end(&mut self) {
         if let Ok(metadata) = std::fs::metadata(&self.path) {
             self.last_offset = metadata.len();

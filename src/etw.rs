@@ -37,13 +37,50 @@ impl FrameRecorder {
     pub fn record_present(&mut self, pid: u32, qpc_timestamp: i64) {
         let queue = self.pids.entry(pid).or_default();
         queue.push_back(qpc_timestamp);
-        // Retain only last ~500 frames per PID to avoid unbounded growth
-        if queue.len() > 500 {
+        // Retain last 1000 frames per PID (~4s at 240 FPS) to avoid unbounded growth
+        if queue.len() > 1000 {
             queue.pop_front();
         }
     }
 
-    /// Computes frame intervals (in ms) for the most recent frames within `window`.
+    pub fn current_qpc() -> i64 {
+        let mut now: i64 = 0;
+        unsafe {
+            let _ = QueryPerformanceCounter(&mut now);
+        }
+        now
+    }
+
+    fn extract_intervals(
+        &self,
+        queue: &VecDeque<i64>,
+        cutoff_qpc: i64,
+        warmup_ticks: i64,
+    ) -> Vec<f64> {
+        let mut intervals = Vec::new();
+        let mut prev: Option<i64> = None;
+        let mut warmup_until: Option<i64> = None;
+
+        for &t in queue {
+            if t >= cutoff_qpc {
+                let start = *warmup_until.get_or_insert_with(|| t.saturating_add(warmup_ticks));
+                if t >= start
+                    && let Some(p) = prev
+                    && p >= start
+                {
+                    let dt_ticks = t.saturating_sub(p);
+                    let dt_ms = (dt_ticks as f64 * 1000.0) / (self.qpc_frequency as f64);
+                    if dt_ms > 0.5 && dt_ms < 1000.0 {
+                        intervals.push(dt_ms);
+                    }
+                }
+            }
+            prev = Some(t);
+        }
+        intervals
+    }
+
+    /// Computes frame intervals (in ms) for the most recent frames relative to the last recorded frame.
     pub fn get_frame_intervals(&self, pid: u32, window: Duration) -> Vec<f64> {
         let queue = match self.pids.get(&pid) {
             Some(q) if q.len() >= 2 => q,
@@ -57,26 +94,35 @@ impl FrameRecorder {
 
         let window_ticks = ((window.as_secs_f64()) * (self.qpc_frequency as f64)) as i64;
         let cutoff_qpc = last_qpc.saturating_sub(window_ticks);
-
-        let mut intervals = Vec::new();
-        let mut prev: Option<i64> = None;
-
-        for &t in queue {
-            if t >= cutoff_qpc
-                && let Some(p) = prev
-            {
-                let dt_ticks = t.saturating_sub(p);
-                let dt_ms = (dt_ticks as f64 * 1000.0) / (self.qpc_frequency as f64);
-                if dt_ms > 0.5 && dt_ms < 1000.0 {
-                    intervals.push(dt_ms);
-                }
-            }
-            prev = Some(t);
-        }
-        intervals
+        self.extract_intervals(queue, cutoff_qpc, 0)
     }
 
-    /// Computes current FPS for `pid` over the specified window.
+    /// Computes frame intervals (in ms) within `window` relative to current wall-clock QPC.
+    /// Returns empty if the game has stopped presenting (loading screen, alt-tab, freeze).
+    pub fn get_frame_intervals_recent(&self, pid: u32, window: Duration) -> Vec<f64> {
+        self.get_frame_intervals_recent_at(pid, window, Self::current_qpc(), Duration::ZERO)
+    }
+
+    /// Computes frame intervals relative to an explicit `now_qpc`, optionally discarding `warmup` after the first frame in window.
+    pub fn get_frame_intervals_recent_at(
+        &self,
+        pid: u32,
+        window: Duration,
+        now_qpc: i64,
+        warmup: Duration,
+    ) -> Vec<f64> {
+        let queue = match self.pids.get(&pid) {
+            Some(q) if q.len() >= 2 => q,
+            _ => return Vec::new(),
+        };
+
+        let window_ticks = ((window.as_secs_f64()) * (self.qpc_frequency as f64)) as i64;
+        let warmup_ticks = ((warmup.as_secs_f64()) * (self.qpc_frequency as f64)) as i64;
+        let cutoff_qpc = now_qpc.saturating_sub(window_ticks);
+        self.extract_intervals(queue, cutoff_qpc, warmup_ticks)
+    }
+
+    /// Computes current FPS for `pid` over the specified window relative to the last recorded frame.
     pub fn get_current_fps(&self, pid: u32, window: Duration) -> Option<f64> {
         let intervals = self.get_frame_intervals(pid, window);
         if intervals.len() < 3 {
@@ -88,6 +134,58 @@ impl FrameRecorder {
         }
         let avg_frame_ms = total_ms / (intervals.len() as f64);
         Some(1000.0 / avg_frame_ms)
+    }
+
+    /// Computes live FPS for `pid` over `window` relative to current QPC (returns `None` when idle/stalled).
+    pub fn get_current_fps_recent(&self, pid: u32, window: Duration) -> Option<f64> {
+        let intervals = self.get_frame_intervals_recent(pid, window);
+        if intervals.len() < 3 {
+            return None;
+        }
+        let total_ms: f64 = intervals.iter().sum();
+        if total_ms <= 0.0 {
+            return None;
+        }
+        Some(1000.0 / (total_ms / intervals.len() as f64))
+    }
+
+    /// Computes trimmed-mean FPS over `window`, discarding initial `warmup` transition frames and 5% top/bottom outliers.
+    pub fn get_trimmed_fps_recent(
+        &self,
+        pid: u32,
+        window: Duration,
+        warmup: Duration,
+    ) -> Option<f64> {
+        self.get_trimmed_fps_recent_at(pid, window, Self::current_qpc(), warmup)
+    }
+
+    pub fn get_trimmed_fps_recent_at(
+        &self,
+        pid: u32,
+        window: Duration,
+        now_qpc: i64,
+        warmup: Duration,
+    ) -> Option<f64> {
+        let mut intervals = self.get_frame_intervals_recent_at(pid, window, now_qpc, warmup);
+        if intervals.len() < 3 {
+            return None;
+        }
+        intervals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let slice = if intervals.len() >= 10 {
+            let trim = ((intervals.len() as f64) * 0.05).floor() as usize;
+            if trim * 2 < intervals.len() {
+                &intervals[trim..intervals.len() - trim]
+            } else {
+                &intervals[..]
+            }
+        } else {
+            &intervals[..]
+        };
+        let total_ms: f64 = slice.iter().sum();
+        if total_ms <= 0.0 || slice.is_empty() {
+            return None;
+        }
+        Some(1000.0 / (total_ms / slice.len() as f64))
     }
 
     pub fn clear_pid(&mut self, pid: u32) {
@@ -109,10 +207,9 @@ unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
     let provider = rec.EventHeader.ProviderId;
     let event_id = rec.EventHeader.EventDescriptor.Id;
 
-    // Check if this is a Present event
+    // Check if this is a Present event (DXGI Present_Start = 42, MPO Present_Start = 55; D3D9 = 1)
     let is_present = if provider == DXGI_PROVIDER_GUID {
-        // DXGIPresent_Start is 42
-        event_id == 42
+        event_id == 42 || event_id == 55
     } else if provider == D3D9_PROVIDER_GUID {
         event_id == 1
     } else {
@@ -178,7 +275,8 @@ impl EtwTraceSession {
             );
         }
 
-        // Reset buffer for StartTraceW
+        // Completely re-zero and reset buffer for StartTraceW
+        buf = unsafe { std::mem::zeroed() };
         buf.props.Wnode.BufferSize = buf_size;
         buf.props.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
         buf.props.Wnode.ClientContext = 1;
@@ -201,8 +299,8 @@ impl EtwTraceSession {
             }
 
             // Enable DXGI provider with verbose level (5) and all keywords (u64::MAX)
-            // to ensure Present events (Id 42) in the Analytic/Logging channels are delivered
-            let _ = EnableTraceEx2(
+            // to ensure Present events (Id 42 / 55) in the Analytic/Logging channels are delivered
+            let dxgi_status = EnableTraceEx2(
                 session_handle,
                 &DXGI_PROVIDER_GUID,
                 EVENT_CONTROL_CODE_ENABLE_PROVIDER.0,
@@ -212,9 +310,18 @@ impl EtwTraceSession {
                 0,
                 None,
             );
+            if dxgi_status.is_err() {
+                let _ = ControlTraceW(
+                    session_handle,
+                    PCWSTR::null(),
+                    &mut buf.props,
+                    EVENT_TRACE_CONTROL_STOP,
+                );
+                return Err(format!("EnableTraceEx2(DXGI) failed: {:?}", dxgi_status));
+            }
 
             // Enable D3D9 provider
-            let _ = EnableTraceEx2(
+            let d3d9_status = EnableTraceEx2(
                 session_handle,
                 &D3D9_PROVIDER_GUID,
                 EVENT_CONTROL_CODE_ENABLE_PROVIDER.0,
@@ -224,12 +331,19 @@ impl EtwTraceSession {
                 0,
                 None,
             );
+            if d3d9_status.is_err() {
+                crate::logger::log_warn(format!(
+                    "EnableTraceEx2(D3D9) failed: {:?} (DXGI still active)",
+                    d3d9_status
+                ));
+            }
 
             // Open realtime consumer trace - allocate on heap so pointer remains valid
             let mut logfile = Box::new(std::mem::zeroed::<EVENT_TRACE_LOGFILEW>());
             logfile.LoggerName = PWSTR(session_name.as_mut_ptr());
-            logfile.Anonymous1.ProcessTraceMode =
-                PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+            logfile.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME
+                | PROCESS_TRACE_MODE_EVENT_RECORD
+                | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
             logfile.Anonymous2.EventRecordCallback = Some(event_record_callback);
 
             let trace_handle = OpenTraceW(&mut *logfile);
@@ -335,5 +449,59 @@ mod tests {
 
         let fps = rec.get_current_fps(pid, Duration::from_secs(2)).unwrap();
         assert!((fps - 60.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_recent_intervals_ignores_stale_frames() {
+        let mut rec = FrameRecorder::default();
+        let pid = 4242;
+        let freq = rec.qpc_frequency;
+        let step = freq / 60;
+        let now_qpc = FrameRecorder::current_qpc();
+        let ten_secs_ago = now_qpc - (freq * 10);
+
+        for i in 0..60 {
+            rec.record_present(pid, ten_secs_ago + i * step);
+        }
+
+        // Old get_frame_intervals returns stale frames, while _recent returns empty
+        assert!(!rec.get_frame_intervals(pid, Duration::from_secs(2)).is_empty());
+        assert!(rec.get_frame_intervals_recent(pid, Duration::from_secs(2)).is_empty());
+        assert!(rec.get_current_fps_recent(pid, Duration::from_secs(2)).is_none());
+    }
+
+    #[test]
+    fn test_trimmed_fps_recent_discards_warmup_and_outliers() {
+        let mut rec = FrameRecorder::default();
+        let pid = 4243;
+        let freq = rec.qpc_frequency;
+        let mut ts: i64 = 10_000_000_000;
+
+        // First 250ms warmup at 30 FPS (transition frames after limiter disengage)
+        let step_30 = freq / 30;
+        for _ in 0..8 {
+            rec.record_present(pid, ts);
+            ts += step_30;
+        }
+        // Next 1.0s at steady 120 FPS with one huge 80ms spike
+        let step_120 = freq / 120;
+        for i in 0..120 {
+            rec.record_present(pid, ts);
+            ts += if i == 60 { step_120 * 10 } else { step_120 };
+        }
+
+        let fps = rec
+            .get_trimmed_fps_recent_at(
+                pid,
+                Duration::from_secs_f64(1.3),
+                ts,
+                Duration::from_millis(260),
+            )
+            .expect("Expected trimmed FPS");
+        assert!(
+            (fps - 120.0).abs() < 3.0,
+            "Expected ~120 FPS after warmup & outlier trim, got {:.2}",
+            fps
+        );
     }
 }

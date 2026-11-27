@@ -1,13 +1,11 @@
-﻿# Automated packaging script for "THE FREAK" (v0.2.0)
+﻿# Automated packaging script for "FramePacer Companion" (v0.3.0)
 # Produces a clean distributable layout:
 # dist/
-# ├── THE_FREAK.exe
+# ├── FramePacerCompanion.exe
 # ├── data/
 # │   ├── config.toml
-# │   ├── window.json
-# │   └── assets/
-# │       └── kaine-cry.gif
-# └── THE_FREAK-v0.2.0.zip
+# │   └── window.json
+# └── FramePacerCompanion-v0.3.0.zip
 
 $ErrorActionPreference = "Stop"
 
@@ -23,26 +21,21 @@ if ($LASTEXITCODE -ne 0) {
 
 $distDir = Join-Path $projectRoot "dist"
 $dataDir = Join-Path $distDir "data"
-$assetsDir = Join-Path $dataDir "assets"
 
 Write-Host "==> Assembling dist folder..." -ForegroundColor Cyan
 if (Test-Path $distDir) {
     Remove-Item -Recurse -Force $distDir
 }
 
-New-Item -ItemType Directory -Path $assetsDir -Force | Out-Null
+New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
 
 $srcExe = Join-Path $projectRoot "target\release\framepacer-the-freak.exe"
-$destExe = Join-Path $distDir "THE_FREAK.exe"
+$destExe = Join-Path $distDir "FramePacerCompanion.exe"
 Copy-Item $srcExe $destExe
 
 $srcConfig = Join-Path $projectRoot "config.toml"
 $destConfig = Join-Path $dataDir "config.toml"
 Copy-Item $srcConfig $destConfig
-
-$srcGif = Join-Path $projectRoot "assets\kaine-cry.gif"
-$destGif = Join-Path $assetsDir "kaine-cry.gif"
-Copy-Item $srcGif $destGif
 
 # Create initial window.json if not present
 $windowJsonPath = Join-Path $dataDir "window.json"
@@ -59,9 +52,28 @@ if ($preZipItems.Count -ne 2) {
 Write-Host "`nDistributable successfully assembled in $($distDir):" -ForegroundColor Green
 $preZipItems | ForEach-Object { Write-Host "  - $($_.Name)" }
 
-# Create release zip archive containing THE_FREAK.exe and data/
-$zipPath = Join-Path $distDir "THE_FREAK-v0.2.0.zip"
+# Create release zip archive containing FramePacerCompanion.exe and data/
+$zipPath = Join-Path $distDir "FramePacerCompanion-v0.3.0.zip"
 Write-Host "`n==> Creating release archive: $zipPath..." -ForegroundColor Cyan
 Compress-Archive -Path $destExe, $dataDir -DestinationPath $zipPath -Force
 
 Write-Host "Release package successfully created at: $zipPath" -ForegroundColor Green
+
+# When living under <appRoot>/data/source, sync updated exe up to <appRoot>
+$parentDataDir = Split-Path -Parent $projectRoot
+if ((Split-Path -Leaf $projectRoot) -eq "source" -and (Split-Path -Leaf $parentDataDir) -eq "data") {
+    $appRoot = Split-Path -Parent $parentDataDir
+    Write-Host "`n==> Syncing top-level app at $appRoot (preserving user data)..." -ForegroundColor Cyan
+    Copy-Item $destExe (Join-Path $appRoot "FramePacerCompanion.exe") -Force
+
+    $legacyExe = Join-Path $appRoot "THE_FREAK.exe"
+    if (Test-Path $legacyExe) {
+        Remove-Item $legacyExe -Force -ErrorAction SilentlyContinue
+    }
+
+    $parentConfig = Join-Path $parentDataDir "config.toml"
+    if (-not (Test-Path $parentConfig)) {
+        Copy-Item $srcConfig $parentConfig
+    }
+    Write-Host "Top-level FramePacerCompanion.exe synced (preserved config.toml, window.json, and logs)." -ForegroundColor Green
+}

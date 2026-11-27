@@ -19,40 +19,65 @@ pub const IPC_MAGIC: u32 = 0x43504946;
 /// FramePacer IPC Header Version (5)
 pub const IPC_VERSION: u32 = 5;
 
-// --- Native FramePacer Protocol Offsets (revealed by reverse engineering) ---
+// --- Native FramePacer Protocol Offsets (verified against framepacer.exe & framepacer.dll) ---
+/// Offset to FramePacer owner process ID (u32) in shared memory header
+pub const OFFSET_OWNER_PID: usize = 0x00c; // 12 decimal
+
+/// Offset to IPC active status flag (u32: 1 = active, 2 / 0xDEAD = shutting down / closed)
+pub const OFFSET_IPC_ACTIVE: usize = 0x020; // 32 decimal
+
 /// Offset to native target FPS in millihertz (u32: fps * 1000, e.g. 60000 = 60.0 FPS)
 pub const OFFSET_REAL_TARGET_FPS_MHZ: usize = 0x028; // 40 decimal
 
 /// Offset to native limiter enabled flag (u32: 1 = enabled, 0 = disabled)
 pub const OFFSET_REAL_LIMITER_ENABLED: usize = 0x02c; // 44 decimal
 
-/// Offset to display refresh rate in millihertz (u32, e.g. 200000 = 200.000 Hz)
-pub const OFFSET_REFRESH_RATE_MHZ: usize = 0x030; // 48 decimal
+/// Offset to frametime ring write index (u32) in FramePacer v5
+pub const OFFSET_FRAMETIME_WRITE_IDX: usize = 0x030; // 48 decimal
 
-/// Offset to limiter mode (u32: 2 = normal)
-pub const OFFSET_LIMITER_MODE: usize = 0x034; // 52 decimal
+/// Backward-compatible alias for offset 0x030 (frametime ring write index in FramePacer v5).
+pub const OFFSET_REFRESH_RATE_MHZ: usize = OFFSET_FRAMETIME_WRITE_IDX;
+
+/// Offset to process active state (u32: 2 = inactive/bypass, != 2 = active)
+pub const OFFSET_PROCESS_ACTIVE_STATE: usize = 0x034; // 52 decimal
+
+/// Offset to limiter mode (u32: 2 = normal/inactive)
+pub const OFFSET_LIMITER_MODE: usize = OFFSET_PROCESS_ACTIVE_STATE;
+
+/// Offset to the 120-entry `f64` frametime ring buffer (in ms) written by framepacer.dll
+pub const OFFSET_FRAMETIME_RING: usize = 0x038; // 56 decimal
+
+/// Number of `f64` entries in FramePacer's shared-memory frametime ring buffer
+pub const FRAMETIME_RING_LEN: usize = 120;
 
 /// Offset to in-game pacing DLL attachment status (u32: 1 = attached, 0 = detached)
 pub const OFFSET_DLL_ATTACHED: usize = 0x408; // 1032 decimal
 
-/// Offset to in-game target process ID in FramePacer GUI (u32)
+/// Offset to probe/state enum in FramePacer v5 (u32: NOT a PID — e.g. 2 during probe)
 pub const OFFSET_GAME_PID: usize = 0x40c; // 1036 decimal
 
 /// Offset to in-game target process ID written by in-game DLL hook (u32)
 pub const OFFSET_DLL_GAME_PID: usize = 0x420; // 1056 decimal
 
-// --- Backward-Compatible Offsets (Specified in Task Prompt & Tests) ---
+/// Offset to in-game pacing active flag (u32: non-zero = actively pacing)
+pub const OFFSET_PACING_ACTIVE: usize = 0x424; // 1060 decimal
+
+/// Offset to IPC seqlock counter in FramePacer v5
+pub const OFFSET_SEQLOCK: usize = 0x4dc; // 1244 decimal
+
+// --- Backward-Compatible Offsets (Mock Test Harness Only) ---
 /// Legacy specification offset for limiter_enabled (0x408).
 /// In native FramePacer protocol, 0x408 is OFFSET_DLL_ATTACHED, and real limiter flag is 0x02c.
 pub const OFFSET_LIMITER_ENABLED: usize = 0x408; // 1032 decimal
 
 /// Specification compatibility offset for target_fps (0x414).
-/// In native FramePacer protocol, target FPS is stored in millihertz at 0x028.
+/// In native FramePacer protocol, 0x410..0x41F is a 16-byte API name buffer; NEVER write 0x414 on live FramePacer.
 pub const OFFSET_TARGET_FPS: usize = 0x414; // 1044 decimal
 
 #[derive(Debug)]
 pub enum IpcError {
     NotConnected,
+    SectionClosed,
     OpenMappingFailed(windows::core::Error),
     MapViewFailed(windows::core::Error),
     CreateMappingFailed(windows::core::Error),
@@ -62,6 +87,7 @@ impl fmt::Display for IpcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotConnected => write!(f, "FramePacer IPC is not connected"),
+            Self::SectionClosed => write!(f, "FramePacer IPC section was closed or shut down"),
             Self::OpenMappingFailed(e) => {
                 write!(f, "Failed to open FramePacer file mapping: {}", e)
             }
@@ -117,6 +143,26 @@ impl FramepacerIpc {
         !self.view_ptr.is_null()
     }
 
+    /// Verifies that the mapped FramePacer section has valid magic, version, size, and active == 1.
+    pub fn is_alive(&self) -> bool {
+        if !self.is_connected() {
+            return false;
+        }
+        fence(Ordering::SeqCst);
+        let alive = unsafe {
+            let magic = std::ptr::read_volatile(self.view_ptr as *const u32);
+            let version = std::ptr::read_volatile(self.view_ptr.add(4) as *const u32);
+            let size = std::ptr::read_volatile(self.view_ptr.add(8) as *const u32);
+            let active = std::ptr::read_volatile(self.view_ptr.add(OFFSET_IPC_ACTIVE) as *const u32);
+            magic == IPC_MAGIC
+                && version == IPC_VERSION
+                && size == IPC_SECTION_SIZE as u32
+                && active == 1
+        };
+        fence(Ordering::SeqCst);
+        alive
+    }
+
     /// Connects to the existing FramePacer shared memory section.
     pub fn connect(&mut self) -> Result<(), IpcError> {
         self.disconnect();
@@ -151,6 +197,11 @@ impl FramepacerIpc {
             self.handle = Some(handle);
             self.view_ptr = view_ptr as *mut u8;
             self.is_owner = false;
+        }
+
+        if !self.is_alive() {
+            self.disconnect();
+            return Err(IpcError::SectionClosed);
         }
 
         Ok(())
@@ -209,19 +260,26 @@ impl FramepacerIpc {
     }
 
     /// Sets the target FPS cap directly in memory.
-    /// Writes both native millihertz at 0x028 (consumed by FramePacer DLL and EXE)
-    /// and direct FPS at 0x414 (for specification / test harness compatibility).
+    /// Writes native millihertz at 0x028 (consumed by FramePacer DLL and EXE).
+    /// Only mirrors direct FPS to 0x414 in mock sections (is_owner == true); on live FramePacer,
+    /// 0x410..0x41F is an API name buffer that must never be overwritten.
     pub fn set_target_fps(&mut self, fps: u32) -> Result<(), IpcError> {
         self.ensure_connected()?;
+        if !self.is_alive() {
+            self.disconnect();
+            return Err(IpcError::SectionClosed);
+        }
         fence(Ordering::SeqCst);
         unsafe {
             // Native FramePacer protocol: target FPS in millihertz at offset 0x28
             let p_real = self.view_ptr.add(OFFSET_REAL_TARGET_FPS_MHZ) as *mut u32;
             std::ptr::write_volatile(p_real, fps.saturating_mul(1000));
 
-            // Mirrored direct FPS at offset 0x414
-            let p_mirror = self.view_ptr.add(OFFSET_TARGET_FPS) as *mut u32;
-            std::ptr::write_volatile(p_mirror, fps);
+            if self.is_owner {
+                // Mirrored direct FPS at offset 0x414 (mock test harness only)
+                let p_mirror = self.view_ptr.add(OFFSET_TARGET_FPS) as *mut u32;
+                std::ptr::write_volatile(p_mirror, fps);
+            }
         }
         fence(Ordering::SeqCst);
         Ok(())
@@ -233,6 +291,10 @@ impl FramepacerIpc {
     /// When connected to live FramePacer, offset 0x408 is protected because it holds OFFSET_DLL_ATTACHED.
     pub fn set_limiter_enabled(&mut self, enabled: bool) -> Result<(), IpcError> {
         self.ensure_connected()?;
+        if !self.is_alive() {
+            self.disconnect();
+            return Err(IpcError::SectionClosed);
+        }
         let val: u32 = if enabled { 1 } else { 0 };
         fence(Ordering::SeqCst);
         unsafe {
@@ -259,6 +321,9 @@ impl FramepacerIpc {
         if !self.is_connected() {
             return Err(IpcError::NotConnected);
         }
+        if !self.is_alive() {
+            return Err(IpcError::SectionClosed);
+        }
         fence(Ordering::SeqCst);
         let (enabled, target_fps) = unsafe {
             let p_real_en = self.view_ptr.add(OFFSET_REAL_LIMITER_ENABLED) as *const u32;
@@ -276,7 +341,7 @@ impl FramepacerIpc {
                 // Limiter state is exclusively at 0x02c. Do NOT check 0x408 here because
                 // 0x408 is OFFSET_DLL_ATTACHED, which is 1 whenever a game is hooked.
                 let fps = if real_fps_mhz > 0 {
-                    real_fps_mhz / 1000
+                    real_fps_mhz.saturating_add(500) / 1000
                 } else {
                     mirror_fps
                 };
@@ -302,39 +367,145 @@ impl FramepacerIpc {
         self.get_state().map(|(en, _)| en)
     }
 
-    /// Returns whether the FramePacer in-game pacing DLL is currently attached (offset 0x408).
+    /// Returns whether the FramePacer in-game pacing DLL is currently attached (0x408 or 0x420 > 4).
     pub fn is_dll_attached(&self) -> Result<bool, IpcError> {
         if !self.is_connected() {
             return Err(IpcError::NotConnected);
         }
+        if !self.is_alive() {
+            return Err(IpcError::SectionClosed);
+        }
         fence(Ordering::SeqCst);
         let attached = unsafe {
-            let p = self.view_ptr.add(OFFSET_DLL_ATTACHED) as *const u32;
-            std::ptr::read_volatile(p) != 0
+            let attached_flag =
+                std::ptr::read_volatile(self.view_ptr.add(OFFSET_DLL_ATTACHED) as *const u32);
+            let dll_pid =
+                std::ptr::read_volatile(self.view_ptr.add(OFFSET_DLL_GAME_PID) as *const u32);
+            attached_flag != 0 || dll_pid > 4
         };
         fence(Ordering::SeqCst);
         Ok(attached)
     }
 
-    /// Reads the target game PID from IPC shared memory if attached.
+    /// Reads the FramePacer owner PID from `OFFSET_OWNER_PID` (`0x00C`) if valid (`> 4`).
+    pub fn get_owner_pid(&self) -> Result<Option<u32>, IpcError> {
+        if !self.is_connected() {
+            return Err(IpcError::NotConnected);
+        }
+        if !self.is_alive() {
+            return Err(IpcError::SectionClosed);
+        }
+        fence(Ordering::SeqCst);
+        let pid = unsafe {
+            let p_owner_pid = self.view_ptr.add(OFFSET_OWNER_PID) as *const u32;
+            let owner_pid = std::ptr::read_volatile(p_owner_pid);
+            if owner_pid > 4 { Some(owner_pid) } else { None }
+        };
+        fence(Ordering::SeqCst);
+        Ok(pid)
+    }
+
+    /// Reads the target game PID from `OFFSET_DLL_GAME_PID` (`0x420`) if valid (`> 4`).
+    /// Does NOT fall back to `0x40C`, which holds a small probe state enum (e.g. `2`), not a PID.
     pub fn get_attached_pid(&self) -> Result<Option<u32>, IpcError> {
         if !self.is_connected() {
             return Err(IpcError::NotConnected);
+        }
+        if !self.is_alive() {
+            return Err(IpcError::SectionClosed);
         }
         fence(Ordering::SeqCst);
         let pid = unsafe {
             let p_dll_pid = self.view_ptr.add(OFFSET_DLL_GAME_PID) as *const u32;
             let dll_pid = std::ptr::read_volatile(p_dll_pid);
-            if dll_pid > 0 {
-                Some(dll_pid)
-            } else {
-                let p_game_pid = self.view_ptr.add(OFFSET_GAME_PID) as *const u32;
-                let game_pid = std::ptr::read_volatile(p_game_pid);
-                if game_pid > 0 { Some(game_pid) } else { None }
-            }
+            if dll_pid > 4 { Some(dll_pid) } else { None }
         };
         fence(Ordering::SeqCst);
         Ok(pid)
+    }
+
+    /// Reads up to `max_samples` recent frametime intervals (in ms) from FramePacer's
+    /// 120-entry `f64` ring buffer (`0x038`) using seqlock `0x4DC`, returning `(write_idx, samples)`.
+    pub fn read_frametime_ring(&self, max_samples: usize) -> Result<(u32, Vec<f64>), IpcError> {
+        if !self.is_connected() {
+            return Err(IpcError::NotConnected);
+        }
+        if !self.is_alive() {
+            return Err(IpcError::SectionClosed);
+        }
+
+        for _ in 0..8 {
+            let (seq1, write_idx, raw_samples, seq2) = unsafe {
+                let seq1 = std::ptr::read_volatile(self.view_ptr.add(OFFSET_SEQLOCK) as *const u32);
+                if (seq1 & 1) != 0 {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                fence(Ordering::SeqCst);
+
+                let write_idx = std::ptr::read_volatile(
+                    self.view_ptr.add(OFFSET_FRAMETIME_WRITE_IDX) as *const u32,
+                );
+                let count = max_samples
+                    .min(FRAMETIME_RING_LEN)
+                    .min(write_idx as usize);
+                let mut buf = Vec::with_capacity(count);
+                let start = write_idx.saturating_sub(count as u32);
+                for i in 0..count {
+                    let idx = start.wrapping_add(i as u32) as usize;
+                    let slot = idx % FRAMETIME_RING_LEN;
+                    let byte_off = OFFSET_FRAMETIME_RING + slot * std::mem::size_of::<f64>();
+                    let p = self.view_ptr.add(byte_off) as *const f64;
+                    let val = std::ptr::read_unaligned(p);
+                    if val.is_finite() && val > 0.5 && val < 1000.0 {
+                        buf.push(val);
+                    }
+                }
+
+                fence(Ordering::SeqCst);
+                let seq2 = std::ptr::read_volatile(self.view_ptr.add(OFFSET_SEQLOCK) as *const u32);
+                (seq1, write_idx, buf, seq2)
+            };
+
+            if seq1 == seq2 {
+                return Ok((write_idx, raw_samples));
+            }
+        }
+
+        Ok((0, Vec::new()))
+    }
+
+    /// Returns whether FramePacer reports the target process as active (offset 0x034 != 2).
+    pub fn is_process_active(&self) -> Result<bool, IpcError> {
+        if !self.is_connected() {
+            return Err(IpcError::NotConnected);
+        }
+        if !self.is_alive() {
+            return Err(IpcError::SectionClosed);
+        }
+        fence(Ordering::SeqCst);
+        let active = unsafe {
+            std::ptr::read_volatile(self.view_ptr.add(OFFSET_PROCESS_ACTIVE_STATE) as *const u32)
+                != 2
+        };
+        fence(Ordering::SeqCst);
+        Ok(active)
+    }
+
+    /// Returns whether the in-game DLL reports pacing is currently active (offset 0x424 != 0).
+    pub fn is_pacing_active(&self) -> Result<bool, IpcError> {
+        if !self.is_connected() {
+            return Err(IpcError::NotConnected);
+        }
+        if !self.is_alive() {
+            return Err(IpcError::SectionClosed);
+        }
+        fence(Ordering::SeqCst);
+        let pacing = unsafe {
+            std::ptr::read_volatile(self.view_ptr.add(OFFSET_PACING_ACTIVE) as *const u32) != 0
+        };
+        fence(Ordering::SeqCst);
+        Ok(pacing)
     }
 
     /// Reconnects to FramePacer shared memory.
@@ -523,6 +694,135 @@ mod tests {
     fn test_unopened_ipc_returns_error() {
         let ipc = FramepacerIpc::with_name(r"Local\NonExistentMapping_99999");
         assert!(!ipc.is_connected());
+        assert!(!ipc.is_alive());
         assert!(ipc.get_state().is_err());
+    }
+
+    #[test]
+    fn test_client_set_target_fps_does_not_overwrite_0x414() {
+        let mock_name = format!(r"Local\TestPreserve0x414_{}", std::process::id());
+        let server = FramepacerIpc::create_mock_for_test(&mock_name)
+            .expect("Failed to create mock shared memory section");
+
+        let api_buf: [u8; 16] = *b"DXGI\0\0\0\0D3D12\0\0\0";
+        unsafe {
+            std::ptr::copy_nonoverlapping(api_buf.as_ptr(), server.view_ptr.add(0x410), 16);
+        }
+
+        let mut client = FramepacerIpc::with_name(&mock_name);
+        client.connect().expect("Client failed to connect");
+        client.set_target_fps(90).expect("set_target_fps failed");
+
+        unsafe {
+            let mhz = std::ptr::read_volatile(
+                server.view_ptr.add(OFFSET_REAL_TARGET_FPS_MHZ) as *const u32
+            );
+            assert_eq!(mhz, 90_000);
+            let actual = std::slice::from_raw_parts(server.view_ptr.add(0x410), 16);
+            assert_eq!(actual, &api_buf, "Client must never clobber 0x410..0x41F");
+        }
+    }
+
+    #[test]
+    fn test_dead_section_0xdead_detection() {
+        let mock_name = format!(r"Local\TestDeadSection_{}", std::process::id());
+        let server = FramepacerIpc::create_mock_for_test(&mock_name)
+            .expect("Failed to create mock shared memory section");
+
+        let mut client = FramepacerIpc::with_name(&mock_name);
+        client.connect().expect("Client failed to connect");
+        assert!(client.is_alive());
+
+        unsafe {
+            std::ptr::write_volatile(server.view_ptr.add(OFFSET_IPC_ACTIVE) as *mut u32, 0xDEAD);
+        }
+
+        assert!(!client.is_alive());
+        assert!(matches!(client.get_state(), Err(IpcError::SectionClosed)));
+    }
+
+    #[test]
+    fn test_millihertz_rounding() {
+        let mock_name = format!(r"Local\TestMhzRounding_{}", std::process::id());
+        let server = FramepacerIpc::create_mock_for_test(&mock_name)
+            .expect("Failed to create mock shared memory section");
+
+        unsafe {
+            std::ptr::write_volatile(
+                server.view_ptr.add(OFFSET_REAL_TARGET_FPS_MHZ) as *mut u32,
+                59_940,
+            );
+        }
+        assert_eq!(server.get_target_fps().unwrap(), 60);
+    }
+
+    #[test]
+    fn test_get_attached_pid_ignores_0x40c_state_enum() {
+        let mock_name = format!(r"Local\TestIgnore0x40c_{}", std::process::id());
+        let server = FramepacerIpc::create_mock_for_test(&mock_name)
+            .expect("Failed to create mock shared memory section");
+
+        unsafe {
+            std::ptr::write_volatile(server.view_ptr.add(OFFSET_DLL_ATTACHED) as *mut u32, 1);
+            std::ptr::write_volatile(server.view_ptr.add(OFFSET_GAME_PID) as *mut u32, 2);
+            std::ptr::write_volatile(server.view_ptr.add(OFFSET_DLL_GAME_PID) as *mut u32, 0);
+        }
+        assert_eq!(server.get_attached_pid().unwrap(), None);
+
+        unsafe {
+            std::ptr::write_volatile(server.view_ptr.add(OFFSET_DLL_GAME_PID) as *mut u32, 9828);
+        }
+        assert_eq!(server.get_attached_pid().unwrap(), Some(9828));
+    }
+
+    #[test]
+    fn test_read_frametime_ring() {
+        let mock_name = format!(r"Local\TestFrametimeRing_{}", std::process::id());
+        let server = FramepacerIpc::create_mock_for_test(&mock_name)
+            .expect("Failed to create mock shared memory section");
+
+        unsafe {
+            for i in 0..10usize {
+                let p = server
+                    .view_ptr
+                    .add(OFFSET_FRAMETIME_RING + i * std::mem::size_of::<f64>())
+                    as *mut f64;
+                std::ptr::write_unaligned(p, 16.667);
+            }
+            std::ptr::write_volatile(
+                server.view_ptr.add(OFFSET_FRAMETIME_WRITE_IDX) as *mut u32,
+                10,
+            );
+            std::ptr::write_volatile(server.view_ptr.add(OFFSET_SEQLOCK) as *mut u32, 20);
+        }
+
+        let (widx, samples) = server.read_frametime_ring(10).unwrap();
+        assert_eq!(widx, 10);
+        assert_eq!(samples.len(), 10);
+        for s in samples {
+            assert!((s - 16.667).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn test_get_owner_pid() {
+        let mock_name = format!(r"Local\TestOwnerPid_{}", std::process::id());
+        let server = FramepacerIpc::create_mock_for_test(&mock_name)
+            .expect("Failed to create mock shared memory section");
+
+        unsafe {
+            std::ptr::write_volatile(server.view_ptr.add(OFFSET_OWNER_PID) as *mut u32, 0);
+        }
+        assert_eq!(server.get_owner_pid().unwrap(), None);
+
+        unsafe {
+            std::ptr::write_volatile(server.view_ptr.add(OFFSET_OWNER_PID) as *mut u32, 4);
+        }
+        assert_eq!(server.get_owner_pid().unwrap(), None);
+
+        unsafe {
+            std::ptr::write_volatile(server.view_ptr.add(OFFSET_OWNER_PID) as *mut u32, 9468);
+        }
+        assert_eq!(server.get_owner_pid().unwrap(), Some(9468));
     }
 }

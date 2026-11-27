@@ -4,6 +4,8 @@ pub mod etw;
 pub mod gif_player;
 pub mod hotkey;
 pub mod ipc;
+pub mod logger;
 pub mod logparse;
 pub mod logtail;
+pub mod telemetry;
 pub mod ui;

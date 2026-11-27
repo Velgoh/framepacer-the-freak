@@ -1,5 +1,16 @@
-# FramePacer The Freak Configuration
-# Companion configuration for automatic FPS limit adjustment (Pulse-Benchmarking Architecture)
+# FramePacer Companion Configuration
+# Companion configuration for automatic FPS limit adjustment
+
+# Pacing mode: "never_off" (headroom-guided, keeps limiter on 100%) or "pulse" (periodic 1s uncapped benchmark)
+pacing_mode = "never_off"
+
+# GPU/CPU headroom thresholds for "never_off" mode
+target_gpu_util_pct = 88.0
+hold_gpu_util_pct = 88.0
+scale_up_gpu_util_pct = 80.0
+max_cpu_thread_util_pct = 85.0
+probe_verify_ms = 500
+wakeup_nudge_interval_secs = 45.0
 
 # Minimum and Maximum FPS bounds
 min_fps = 30

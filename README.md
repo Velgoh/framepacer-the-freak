@@ -1,164 +1,103 @@
-# THE FREAK
+# FramePacer Companion
 
-## Technical Architecture
+<p align="center">
+  <img src="assets/default.gif" width="240" alt="FramePacer Companion" />
+</p>
+
+An automatic, zero-overlay companion utility in Rust for Steam's **FramePacer**. It monitors live frame pacing alongside Windows GPU and per-thread CPU utilization, continuously adjusting FramePacer's FPS cap via shared-memory IPC without disabling the limiter during normal gameplay.
+
+---
+
+## What It Does
+
+1. **Headroom-Guided Never-Off Pacing (`never_off`, default)**:
+   - Keeps FramePacer's limiter engaged continuously while stepping/ramping the cap upward whenever the game is hitting its current cap with spare GPU/CPU headroom.
+   - Steps down smoothly (`step_fps`, default `5`) when sustained late frames indicate a real hardware or engine limit, applying a cooldown so it doesn't bounce back and forth at the GPU wall.
+2. **Cutscene & Software-Lock Detection**:
+   - Detects sudden FPS drops (`JumpTo`) vs. heavy load drops, and distinguishes self-capped cutscenes / in-game FPS limits / VSync (`low GPU + pinned flat FPS`) from real hardware bottlenecks.
+   - Uses invisible `+step_fps` re-probes during software locks so recovery back to unlocked gameplay happens within seconds instead of stalling on a 2-minute ceiling timer.
+3. **Multi-Scenario Safeguards**:
+   - **Alt-Tab / Minimized Pause**: Detects when FramePacer marks the process inactive or the game window is minimized, freezing cap adjustments until the game returns to focus.
+   - **Auto-Detected Log Path**: Resolves `framepacer.exe`'s directory from IPC (`0x00C`) if Steam/FramePacer isn't installed on `C:\`.
+   - **Portable Borderless Window & Custom GIF Picker**: Hover the window to view live telemetry (`IPC` / `ETW`, attached process, status, measured FPS, `G<nn>%`), pause/resume (`F11` hotkey or button), minimize/close, or swap in a custom `.gif` via URL, share page link, file browser, or drag-and-drop (window size and accent colors adapt automatically).
+
+---
+
+## Requirements
+
+- **OS**: Windows 10 / 11 x64
+- **Dependency**: Steam **FramePacer** (`v0.6.0.0` IPC v5 protocol) running on the system
+- **Privileges**: Administrator elevation (manifested automatically on `FramePacerCompanion.exe` for kernel ETW session management and FramePacer IPC access)
+
+---
+
+## Architecture
 
 ```
-+------------------------------------------------------------------+
-|                       framepacer-the-freak                       |
-|                                                                  |
-|   +-------------------+   IPC Writes   +---------------------+   |
-|   | Engine Controller | -------------> | Local\              |   |
-|   |  (Pulse Benchmark |                | FramepacerIPC_v5    |   |
-|   |   State Machine)  |                | (Win32 MMF)         |   |
-|   +-------------------+                +---------------------+   |
-|             ^                                     |              |
-|             | Frame intervals                     v              |
-|   +-------------------+                +---------------------+   |
-|   |   ETW Consumer    |                |     FramePacer      |   |
-|   | (DXGI Present 42) |                | (Injection Limiter) |   |
-|   +-------------------+                +---------------------+   |
-|             ^                                     |              |
-|             | Present QPC                         v              |
-|   +-------------------+                +---------------------+   |
-|   |   Game Process    | <------------- |   framepacer.dll    |   |
-|   | (D3D11/12/DXGI)   |     Pacing     |  (In-game hook)     |   |
-|   +-------------------+                +---------------------+   |
-+------------------------------------------------------------------+
++-----------------------------------------------------------------------+
+|                         FramePacer Companion                          |
+|                                                                       |
+|  +----------------------+   0x028 / 0x02C   +----------------------+  |
+|  |  Engine Controller   | ----------------> | Local\FramepacerIPC  |  |
+|  |  (Never-Off / Pulse  |                   |      _v5 (1256B)     |  |
+|  |   State Machine)     | <---------------- |  (Win32 Shared Mem)  |  |
+|  +----------------------+  0x038 Ring / PID +----------------------+  |
+|        ^          ^                                    |              |
+|        |          | Frametimes                         v              |
+|  +-----+----+ +---+-------------------+    +-----------------------+  |
+|  | Windows  | |     ETW Consumer      |    |      FramePacer       |  |
+|  | PDH GPU  | | DXGI (42, 55) & D3D9  |    |   (framepacer.dll)    |  |
+|  | & Thread | +-----------------------+    +-----------------------+  |
+|  | CPU Mon  |             ^                            |              |
+|  +----------+             | Present QPC                v              |
+|                    +------+----------------------------+------+       |
+|                    |        Game Process (D3D9/11/12)         |       |
+|                    +------------------------------------------+       |
++-----------------------------------------------------------------------+
 ```
 
----
+### Shared Memory (`Local\FramepacerIPC_v5`, 1256 bytes)
 
-## Inter-Process Communication (`Local\FramepacerIPC_v5`)
+| Offset | Type | Description |
+|---|---|---|
+| `0x000` | `u32` | Magic (`0x43504946`, `"FIPC"`) |
+| `0x004` | `u32` | Protocol version (`5`) |
+| `0x008` | `u32` | Section size (`1256`) |
+| `0x00C` | `u32` | FramePacer owner PID |
+| `0x020` | `u32` | IPC active flag (`1` = active, `0xDEAD` = closed) |
+| `0x028` | `u32` | Target FPS in millihertz (`fps * 1000`) |
+| `0x02C` | `u32` | Limiter enabled flag (`1` = ON, `0` = OFF) |
+| `0x030` | `u32` | Frametime ring write index (monotonic) |
+| `0x034` | `u32` | Target process active state (`2` = inactive) |
+| `0x038` | `f64[120]` | Live frametime ring buffer (ms), guarded by seqlock |
+| `0x408` | `u32` | In-game DLL attached flag |
+| `0x420` | `u32` | Attached game PID |
+| `0x4DC` | `u32` | Seqlock counter for ring & API string reads |
 
-The system maps the Win32 file mapping object named `Local\FramepacerIPC_v5` with `FILE_MAP_READ | FILE_MAP_WRITE` permissions.
+### Telemetry Sources
 
-### Shared Memory Section Layout
-
-| Offset (Hex) | Offset (Dec) | Type  | Description |
-|---|---|---|---|
-| `0x000` | 0 | `u32` | Header Magic: `0x43504946` (`"FIPC"`) |
-| `0x004` | 4 | `u32` | Protocol Version (`5`) |
-| `0x008` | 8 | `u32` | Section Allocation Size (`1256` bytes) |
-| `0x020` | 32 | `u32` | IPC Active Status (`1` = active) |
-| `0x028` | 40 | `u32` | Target Framerate in millihertz (`fps * 1000`, e.g. `60000` for 60.0 FPS) |
-| `0x02C` | 44 | `u32` | Limiter State (`1` = enabled, `0` = disabled) |
-| `0x030` | 48 | `u32` | Display Refresh Rate in millihertz |
-| `0x034` | 52 | `u32` | Limiter Execution Mode (`2` = normal) |
-| `0x408` | 1032 | `u32` | In-Game Hook Attachment Flag (`1` = attached) / Mirrored Limiter Flag |
-| `0x40C` | 1036 | `u32` | Target Game Process ID |
-| `0x414` | 1044 | `u32` | Mirrored Target Framerate Cap (direct integer) |
-| `0x420` | 1056 | `u32` | In-Game Hook Active Process ID |
-
-### Atomic Read/Write Semantics
-- Memory writes execute via volatile atomic stores with sequential consistency memory fences (`fence(Ordering::SeqCst)`).
-- Limiter disengagement and re-engagement write directly to offset `0x02C`.
-- Target FPS modifications update native millihertz at `0x028` and direct cap integer at `0x414`.
-
-### Live Shared Memory Polling
-Every 100ms cycle, offset `0x028` / `0x414` is read. If the value differs from the internal active cap state (e.g. an external modification via FramePacer's GUI), the engine immediately synchronizes its internal state, adopts the new cap, and resets the settling timer.
+- **Frametimes**: Prefers whichever live source (`ETW` DXGI events `42`/`55` + D3D9 event `1`, or FramePacer's `0x038` IPC frametime ring sliced to the post-settle window) provides more frames.
+- **GPU Utilization**: Vendor-agnostic Windows PDH `\GPU Engine(*)\Utilization Percentage` across `3d`, `graphics*`, and `compute*` engines on the game's active GPU LUID, with brief-blip tolerance and automatic query recovery.
+- **CPU Utilization**: Per-thread CPU saturation via `ToolHelp` + `GetThreadTimes` to detect single-thread CPU bottlenecks even when total CPU usage looks low.
 
 ---
 
-## Real-Time ETW Metric Acquisition
-
-Frametimes and delivery intervals are measured through kernel Event Tracing for Windows (ETW) without code injection:
-
-- **Primary Provider**: `Microsoft-Windows-DXGI` (`{CA11C036-0102-4A2D-A6AD-F03CFED5D3C9}`)
-- **Event Identifier**: `42` (`DXGIPresent_Start`)
-- **Secondary Provider**: `Microsoft-Windows-D3D9` (`{783ACA0A-790E-4D7F-8451-AA850511C6B9}`)
-- **Event Identifier**: `1`
-
-Timestamps are extracted from `EVENT_HEADER.TimeStamp` as 64-bit QueryPerformanceCounter (QPC) ticks. Frametime intervals ($\Delta t$) are computed relative to the system performance counter frequency ($QPC_{freq}$):
-
-$$\Delta t_{ms} = \frac{\Delta QPC \times 1000}{QPC_{freq}}$$
-
-A per-PID ring buffer maintains a 2.5-second sliding window of frame timestamps.
-
----
-
-## Pulse-Benchmarking State Machine
-
-```
-                         +--------------+
-                         |     Idle     |
-                         +--------------+
-                                | Game Attached / Auto ON
-                                v
-               +----------------------------------+
-               |             Settling             | <---+
-               | (Cooldown window: 1000 - 1500ms) |     |
-               +----------------------------------+     |
-                                | Settle timer expired  |
-                                v                       |
-               +----------------------------------+     | Cap changed
-+------------> |           PacingActive           | ----+
-|              |  (Limiter ON: Continuous Eval)   |
-|              +----------------------------------+
-|                |              |              |
-| KeepCap        | 30s Recheck  | StepDown (-5)| JumpTo (30)
-| (Smooth)       | Elapsed      | (Late ratio) | (Delta >= 15 FPS)
-+----------------+              v              v
-                        +---------------+
-                        |MeasuringNative|
-                        | (1.0s Limiter |
-                        |     OFF)      |
-                        +---------------+
-                                | 1.0s expired -> read ETW native FPS
-                                | snap cap down to 5-FPS boundary
-                                | turn limiter back ON
-                                v
-                        [Trigger Settle]
-```
-
-### Execution Rules
-
-1. **30-Second Periodic Benchmark Pulse**:
-   - Every 30.0 seconds of stable pacing (`stable_recheck_interval_secs`), the engine transitions to `AutoState::MeasuringNative`.
-   - Limiter is disengaged (`0x02C = 0`).
-   - Frame intervals are recorded uncapped for exactly 1.0 second (`measure_duration_secs = 1.0`).
-   - Native uncapped FPS is calculated from the measured interval set:
-     $$FPS_{native} = \frac{N \times 1000}{\sum_{i=1}^{N} \Delta t_i}$$
-   - Target cap is snapped down to the nearest 5-FPS boundary:
-     $$Cap = \left\lfloor \frac{FPS_{native} + 0.5}{5} \right\rfloor \times 5$$
-   - The computed cap is written to `0x028` and `0x414`.
-   - Limiter is immediately re-engaged (`0x02C = 1`).
-   - Engine enters `AutoState::Settling` for 1000ms.
-
-2. **Immediate Downward Cadence Reaction**:
-   - If late frame ratio exceeds `0.05` or $\ge 3$ consecutive late frames occur during `PacingActive`, cap decrements by 5 FPS immediately.
-   - If rendering drops by $\ge 15$ FPS relative to cap (e.g. 30 FPS cutscene), engine snaps cap directly to 30 FPS.
-   - While in drop state, recheck interval is accelerated to 4.0 seconds (`drop_recheck_interval_secs`) to detect gameplay resumption.
-
-3. **Live Cap Synchronization**:
-   - Polling occurs every 100ms. External modifications to `0x028` update the active cap immediately without fighting or reverting user input.
-
----
-
-## Window Geometry & Persistence
-
-- **Dimensions**: Viewport is initialized to `300 x 228` pixels (aspect ratio 1.315:1 matching source visual assets).
-- **Decorations**: System borders and titlebars are disabled (`with_decorations(false)`).
-- **Z-Order**: Configured with `with_always_on_top(true)`.
-- **Position Storage**: Window coordinates are loaded from and saved to `data/window.json`:
-  ```json
-  {
-    "x": 300.0,
-    "y": 200.0
-  }
-  ```
-- **Pointer Gating**: Interactive glyphs (auto sigil, minimize, close) are rendered exclusively when the pointer hovers inside the window area (`hover_pos().is_some()`).
-
----
-
-## Configuration (`config.toml`)
+## Configuration (`data/config.toml`)
 
 ```toml
+pacing_mode = "never_off"          # "never_off" or "pulse"
+target_gpu_util_pct = 88.0         # Target GPU % used for headroom jump sizing
+hold_gpu_util_pct = 88.0           # Above this %, avoid speculative upward probes
+scale_up_gpu_util_pct = 80.0       # Below this %, scale up toward target GPU load
+max_cpu_thread_util_pct = 85.0     # Peak single-thread CPU % limit
+probe_verify_ms = 500              # Upward probe verification window (ms)
+wakeup_nudge_interval_secs = 45.0  # Hold-zone nudge interval
 min_fps = 30
 max_fps = 200
 step_fps = 5
-stable_recheck_interval_secs = 30.0
-measure_duration_secs = 1.0
-drop_recheck_interval_secs = 4.0
+stable_recheck_interval_secs = 30.0 # Pulse mode only
+measure_duration_secs = 1.0         # Pulse mode only
+drop_recheck_interval_secs = 4.0    # Pulse mode only
 spike_tolerance_ms = 2.0
 late_frame_threshold_ratio = 0.05
 drop_detection_fps = 15
@@ -170,21 +109,30 @@ auto_enabled_at_startup = true
 
 ---
 
+## Logs & Troubleshooting
+
+Runtime logs are written to `data/framepacer_companion.log` (rotated automatically at 2 MB on startup), including:
+- `[CONFIG]` startup parameters, elevation status, ETW/PDH initialization, and IPC connection status
+- `[ATTACH]` / `[DETACH]` / `[BACKGROUND]` / `[FOREGROUND]` game lifecycle transitions
+- `[SCALE UP]` / `[PROBE PASS]` / `[PROBE REVERT]` / `[STEP]` / `[CUTSCENE]` / `[SNAP]` decisions with measured FPS, sample count, metric source (`ipc`/`etw`), GPU %, and peak CPU thread %
+- 60-second `[STATUS]` heartbeat summaries while a game is attached
+
+---
+
 ## Build
 
 ### Prerequisites
 - Windows 10 / 11 x64
-- Rust toolchain (edition 2024 / 1.85+)
+- Rust toolchain (edition 2024 / `rustc 1.85+`)
 
-### Compilation
+### Commands
 ```powershell
-cargo build --release
+cargo test
+cargo clippy --all-targets -- -D warnings
+powershell -ExecutionPolicy Bypass -File scripts\package.ps1
 ```
 
-Release artifact generated at:
-```
-target/release/framepacer-the-freak.exe
-```
+Packaged output is generated in `dist/` containing `FramePacerCompanion.exe`, `data/`, and `FramePacerCompanion-v0.3.0.zip`.
 
 ---
 
